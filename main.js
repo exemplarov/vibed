@@ -4088,6 +4088,17 @@ class SessionChatView extends ItemView {
     this.noteBody = "";
     this.noteLoadedFor = null;
     this.noteSeq = 0;
+    // Find-in-chat bar: query state, collected matches (live Ranges), and
+    // the DOM watcher that keeps results honest while content streams in.
+    this.findOpen = false;
+    this.findQuery = "";
+    this.findCaseSensitive = false;
+    this.findMatches = [];
+    this.findIndex = -1;
+    this.findObserver = null;
+    this.findRefreshTimer = null;
+    this.findRestoreFocus = null;
+    this.findTargetEl = null;
   }
 
   getViewType() {
@@ -4234,6 +4245,9 @@ class SessionChatView extends ItemView {
 
   async onClose() {
     this.unsubscribed = true;
+    // Close the find bar: stop its DOM watcher and clear the global
+    // highlight registry (CSS.highlights is document-scoped, not per-view).
+    this.closeFind();
     // Flush an in-flight note edit: the debounce may have a keystroke left.
     if (this.noteSaveTimer) {
       window.clearTimeout(this.noteSaveTimer);
@@ -4281,6 +4295,15 @@ class SessionChatView extends ItemView {
         .then(() => new Notice("Copied session ID"))
         .catch(() => new Notice(this.sessionId));
     });
+    this.findButton = headerActions.createEl("button", {
+      cls: "oc-icon-button oc-find-toggle",
+      attr: {
+        "aria-label": "Find in chat",
+        title: "Find in chat (Ctrl+F / Cmd+F)",
+      },
+    });
+    setIcon(this.findButton, "search");
+    this.findButton.addEventListener("click", () => this.openFind());
     this.refreshButton = headerActions.createEl("button", {
       cls: "oc-icon-button oc-refresh",
       attr: { "aria-label": "Refresh", title: "Refresh" },
@@ -4341,6 +4364,55 @@ class SessionChatView extends ItemView {
       const visualTop = -(el.scrollHeight - el.clientHeight);
       if (el.scrollTop <= visualTop + 140) this.loadOlder();
     });
+
+    // Find bar (Ctrl/Cmd+F): overlays the transcript's top-right corner.
+    // Built before the read-only early return so every connector gets it.
+    this.findBarEl = main.createDiv({ cls: "oc-findbar", attr: { hidden: "" } });
+    this.findInputEl = this.findBarEl.createEl("input", {
+      cls: "oc-find-input",
+      attr: {
+        type: "text",
+        placeholder: "Find in chat…",
+        spellcheck: "false",
+        "aria-label": "Find in chat",
+      },
+    });
+    this.findCountEl = this.findBarEl.createSpan({ cls: "oc-find-count", text: "" });
+    this.findCaseButton = this.findBarEl.createEl("button", {
+      cls: "oc-icon-button oc-find-case",
+      text: "Aa",
+      attr: { "aria-label": "Match case", title: "Match case", "aria-pressed": "false" },
+    });
+    this.findPrevButton = this.findBarEl.createEl("button", {
+      cls: "oc-icon-button oc-find-prev",
+      attr: { "aria-label": "Previous match", title: "Previous match (Shift+Enter)" },
+    });
+    setIcon(this.findPrevButton, "chevron-up");
+    this.findNextButton = this.findBarEl.createEl("button", {
+      cls: "oc-icon-button oc-find-next",
+      attr: { "aria-label": "Next match", title: "Next match (Enter)" },
+    });
+    setIcon(this.findNextButton, "chevron-down");
+    this.findCloseButton = this.findBarEl.createEl("button", {
+      cls: "oc-icon-button oc-find-close",
+      attr: { "aria-label": "Close find bar", title: "Close (Esc)" },
+    });
+    setIcon(this.findCloseButton, "x");
+    this.findInputEl.addEventListener("input", () => {
+      this.findQuery = this.findInputEl.value;
+      this.runFind(true, true);
+    });
+    this.findCaseButton.addEventListener("click", () => this.toggleFindCase());
+    this.findPrevButton.addEventListener("click", () => this.stepFind(-1));
+    this.findNextButton.addEventListener("click", () => this.stepFind(1));
+    this.findCloseButton.addEventListener("click", () => this.closeFind());
+    // Expanding/collapsing a <details> changes what is searchable — "toggle"
+    // does not bubble, but it does travel the capture path.
+    this.registerDomEvent(this.chatEl, "toggle", () => this.scheduleFindRefresh(), true);
+    // The platform-standard binding: Cmd+F (macOS) / Ctrl+F (Win/Linux),
+    // plus the usual navigation keys, caught in the capture phase so they
+    // win over anything else while this view owns the focus.
+    this.registerDomEvent(this.contentEl, "keydown", (event) => this.onFindKeydown(event), true);
 
     // Permission approval banner: sits between the transcript and the
     // composer so a pending approval is always visible (the chat is
@@ -5369,6 +5441,265 @@ class SessionChatView extends ItemView {
     for (const block of content || []) {
       if (block?.type === "text") {
         details.createEl("pre", { cls: "oc-tool-output", text: String(block.text ?? "") });
+      }
+    }
+  }
+
+  // ----- find in chat ---------------------------------------------------------
+
+  // Cmd+F (macOS) / Ctrl+F (Win/Linux). Alt and Shift combinations belong
+  // to other shortcuts (Obsidian's global search etc.) and stay untouched.
+  isFindShortcut(event) {
+    return (
+      !event.altKey &&
+      !event.shiftKey &&
+      (event.metaKey || event.ctrlKey) &&
+      !event.isComposing &&
+      event.key.toLowerCase() === "f"
+    );
+  }
+
+  onFindKeydown(event) {
+    if (this.isFindShortcut(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!this.findOpen) this.openFind();
+      else {
+        this.findInputEl.focus();
+        this.findInputEl.select();
+      }
+      return;
+    }
+    if (!this.findOpen || event.isComposing) return;
+    let direction = 0;
+    if (event.key === "Enter") direction = event.shiftKey ? -1 : 1;
+    else if (event.key === "F3") direction = event.shiftKey ? -1 : 1; // Win/Linux convention
+    else if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "g") {
+      direction = event.shiftKey ? -1 : 1; // Cmd+G / Ctrl+G — browser "find again"
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      this.closeFind();
+      return;
+    }
+    if (direction) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.stepFind(direction);
+    }
+  }
+
+  openFind() {
+    if (!this.findBarEl) return;
+    if (this.findOpen) {
+      this.findInputEl.focus();
+      this.findInputEl.select();
+      return;
+    }
+    this.findOpen = true;
+    const active = document.activeElement;
+    this.findRestoreFocus = active && this.contentEl.contains(active) ? active : null;
+    this.findBarEl.removeAttribute("hidden");
+    // Live content (streaming deltas, load-older, reconcile re-renders)
+    // must keep the result set honest — watch the transcript while open.
+    this.findObserver = new MutationObserver(() => this.scheduleFindRefresh());
+    this.findObserver.observe(this.chatEl, { childList: true, subtree: true, characterData: true });
+    this.findInputEl.focus();
+    this.findInputEl.select();
+    this.runFind(true, true);
+  }
+
+  closeFind() {
+    if (this.findObserver) {
+      this.findObserver.disconnect();
+      this.findObserver = null;
+    }
+    if (this.findRefreshTimer) {
+      window.clearTimeout(this.findRefreshTimer);
+      this.findRefreshTimer = null;
+    }
+    this.findOpen = false;
+    this.findMatches = [];
+    this.findIndex = -1;
+    this.clearFindHighlights();
+    this.updateFindCount();
+    if (this.findBarEl) this.findBarEl.setAttribute("hidden", "");
+    const restore = this.findRestoreFocus;
+    this.findRestoreFocus = null;
+    if (restore && restore.isConnected) restore.focus();
+  }
+
+  toggleFindCase() {
+    this.findCaseSensitive = !this.findCaseSensitive;
+    if (this.findCaseButton) {
+      this.findCaseButton.classList.toggle("is-active", this.findCaseSensitive);
+      this.findCaseButton.setAttribute("aria-pressed", String(this.findCaseSensitive));
+    }
+    this.runFind(true, true);
+  }
+
+  scheduleFindRefresh() {
+    if (!this.findOpen) return;
+    if (this.findRefreshTimer) window.clearTimeout(this.findRefreshTimer);
+    this.findRefreshTimer = window.setTimeout(() => {
+      this.findRefreshTimer = null;
+      if (this.findOpen) this.runFind(true, false);
+    }, 150);
+  }
+
+  // Walks the rendered transcript in visual order (oldest first — the chat
+  // is column-reverse, so DOM order is newest-first). Only VISIBLE text is
+  // searched: nodes inside a collapsed <details> (thinking bodies, tool
+  // input/output) are skipped until expanded; their summaries stay in.
+  collectFindMatches() {
+    const query = this.findQuery;
+    if (!query) return { matches: [], visual: new Map() };
+    const messages = [...this.chatEl.querySelectorAll(".oc-msg")].reverse();
+    const visual = new Map(messages.map((el, index) => [el, index]));
+    const needle = this.findCaseSensitive ? query : query.toLowerCase();
+    const accept = (node) => {
+      const el = node.parentElement;
+      if (!el || !el.closest(".oc-msg")) return NodeFilter.FILTER_REJECT;
+      for (let p = el; p && p !== this.chatEl; p = p.parentElement) {
+        if (p.tagName === "DETAILS" && !p.open) return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    };
+    const matches = [];
+    for (const message of messages) {
+      const walker = document.createTreeWalker(message, NodeFilter.SHOW_TEXT, { acceptNode: accept });
+      let nodeIndex = -1;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        nodeIndex += 1;
+        const value = this.findCaseSensitive ? node.nodeValue : node.nodeValue.toLowerCase();
+        let at = value.indexOf(needle);
+        while (at !== -1) {
+          const range = document.createRange();
+          range.setStart(node, at);
+          range.setEnd(node, at + needle.length);
+          matches.push({ range, msgEl: message, visualIndex: visual.get(message), nodeIndex, startOffset: at });
+          at = value.indexOf(needle, at + needle.length);
+        }
+      }
+    }
+    return { matches, visual };
+  }
+
+  // Recomputes matches and repaints highlights. `preservePosition` resumes
+  // at the previous match's spot (query edits, live refreshes); `scroll`
+  // jumps the viewport to the current match (user-driven runs only — a
+  // streaming refresh must never yank the scroll position).
+  runFind(preservePosition = false, scroll = true) {
+    if (!this.findOpen) return;
+    const previous = this.findMatches[this.findIndex];
+    const anchor =
+      preservePosition && previous
+        ? { msgEl: previous.msgEl, nodeIndex: previous.nodeIndex, startOffset: previous.startOffset }
+        : null;
+    this.clearFindHighlights();
+    const { matches, visual } = this.collectFindMatches();
+    this.findMatches = matches;
+    let index = 0;
+    if (anchor && matches.length) {
+      const anchorVisual =
+        anchor.msgEl && anchor.msgEl.isConnected ? visual.get(anchor.msgEl) ?? -1 : -1;
+      index = matches.findIndex(
+        (m) =>
+          m.visualIndex > anchorVisual ||
+          (m.visualIndex === anchorVisual &&
+            (m.nodeIndex > anchor.nodeIndex ||
+              (m.nodeIndex === anchor.nodeIndex && m.startOffset >= anchor.startOffset))),
+      );
+      if (index === -1) index = 0; // previous spot no longer matches — wrap to the top
+    }
+    this.findIndex = matches.length ? index : -1;
+    this.applyFindHighlights(scroll);
+    this.updateFindCount();
+  }
+
+  applyFindHighlights(scroll = true) {
+    const current = this.findMatches[this.findIndex];
+    if (this.findMatches.length && typeof Highlight === "function" && typeof CSS !== "undefined" && CSS.highlights) {
+      // CSS Custom Highlight API: paints without touching the DOM, so
+      // markdown re-renders and streaming deltas stay untouched.
+      CSS.highlights.set("vibed-find", new Highlight(...this.findMatches.map((m) => m.range)));
+      CSS.highlights.set("vibed-find-current", current ? new Highlight(current.range) : new Highlight());
+      if (scroll) this.scrollMatchIntoView(current);
+      return;
+    }
+    // Fallback (no highlight API): counting and navigation still work; ring
+    // the current match's block so it is findable on screen.
+    if (current) {
+      this.findTargetEl =
+        current.range.startContainer.parentElement?.closest(
+          ".oc-text, .oc-bubble, pre, .oc-reasoning-body, summary, .oc-msg-meta, .oc-note, .oc-tool-head, .oc-msg",
+        ) || null;
+      this.findTargetEl?.addClass("oc-find-target");
+      if (scroll) this.scrollMatchIntoView(current);
+    }
+  }
+
+  clearFindHighlights() {
+    if (this.findTargetEl) {
+      this.findTargetEl.removeClass("oc-find-target");
+      this.findTargetEl = null;
+    }
+    if (typeof CSS !== "undefined" && CSS.highlights) {
+      CSS.highlights.delete("vibed-find");
+      CSS.highlights.delete("vibed-find-current");
+    }
+  }
+
+  stepFind(direction) {
+    if (!this.findMatches.length) return;
+    this.findIndex = (this.findIndex + direction + this.findMatches.length) % this.findMatches.length;
+    this.applyFindHighlights(true);
+    this.updateFindCount();
+  }
+
+  updateFindCount() {
+    if (!this.findCountEl) return;
+    if (!this.findQuery) {
+      this.findCountEl.setText("");
+      this.findCountEl.removeClass("is-empty");
+      return;
+    }
+    if (!this.findMatches.length) {
+      // Older history may simply not be loaded yet — say so instead of a
+      // bare zero (only the loaded transcript is searched).
+      const unloaded = !!this.cursorOlder;
+      this.findCountEl.setText(unloaded ? "0 in loaded" : "0 matches");
+      this.findCountEl.title = unloaded
+        ? "No matches among the loaded messages — older history pages in as you scroll to the top"
+        : "";
+      this.findCountEl.addClass("is-empty");
+      return;
+    }
+    this.findCountEl.setText(`${this.findIndex + 1}/${this.findMatches.length}`);
+    this.findCountEl.title = "";
+    this.findCountEl.removeClass("is-empty");
+  }
+
+  scrollMatchIntoView(match) {
+    if (!match || !this.chatEl) return;
+    // Inner scrollables first (tool input/output <pre> are height-capped
+    // and scroll on their own), then the transcript itself, centering the
+    // match. column-reverse scrollTop is 0 at the bottom and negative
+    // upward, but pixel deltas still map 1:1 to visual movement.
+    const scrollers = [];
+    for (let p = match.range.startContainer.parentElement; p && p !== this.chatEl; p = p.parentElement) {
+      if (p.scrollHeight > p.clientHeight + 1) scrollers.push(p);
+    }
+    if (this.chatEl.scrollHeight > this.chatEl.clientHeight + 1) scrollers.push(this.chatEl);
+    for (const scroller of scrollers) {
+      const rect = match.range.getBoundingClientRect();
+      const box = scroller.getBoundingClientRect();
+      if (scroller === this.chatEl) {
+        scroller.scrollTop += rect.top + rect.height / 2 - (box.top + box.height / 2);
+      } else if (rect.top < box.top + 8) {
+        scroller.scrollTop -= box.top + 8 - rect.top;
+      } else if (rect.bottom > box.bottom - 8) {
+        scroller.scrollTop += rect.bottom - (box.bottom - 8);
       }
     }
   }

@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.11.1-blue)
+![version](https://img.shields.io/badge/version-0.12.0-blue)
 
 ## Connectors
 
@@ -64,6 +64,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).
 - **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Session chat view**: messages stream in live (text + reasoning + tool calls with input/output); history loads the newest page first and pages in older messages as you scroll to the top. Works for every connector (read-only ones simply don't stream).
+- **Find in chat**: `Ctrl+F` / `Cmd+F` opens a browser-style find bar over the transcript — live match count, all-matches highlighting, `Enter`/`Shift+Enter` (also `F3`, `Cmd/Ctrl+G`) to navigate with wrap-around, `Aa` toggles case sensitivity, `Esc` closes and restores focus. Searches exactly what's on screen: collapsed Thinking / tool Input / Output sections are skipped until you expand them (expanding re-runs the search live), and streaming or newly paged-in messages refresh the results automatically.
 - **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message.
 - **Model selector**: defaults match OpenCode exactly — the last-used model *and* its persisted variant, falling back to the server's location-aware default; existing sessions switch live.
