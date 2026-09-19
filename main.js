@@ -1,4 +1,4 @@
-const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Modal, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
+const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Menu, Modal, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -272,6 +272,156 @@ function runSqlite(sqlitePath, databasePath, sql) {
       },
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// Workspace-directory operations (chat ⋮ menu + new-session picker cards):
+// copy the path, open it in the system file manager, or open a terminal
+// there. Same fire-and-forget policy as the sqlite3/zstd helpers: desktop
+// only, spawned locally, failures surface as a Notice.
+// ---------------------------------------------------------------------------
+
+// Fire-and-forget execFile: helpers are spawned detached so a lingering
+// terminal or file manager window never pins the plugin. `what` completes
+// the "Could not <what>: …" notice on spawn/exit failure.
+function spawnHelperBinary(command, args, what, options = {}) {
+  try {
+    execFile(
+      command,
+      args,
+      { windowsHide: true, detached: true },
+      (error) => {
+        if (error && !options.ignoreErrors) new Notice(`Could not ${what}: ${error.message}`);
+      },
+    ).unref();
+  } catch (error) {
+    if (!options.ignoreErrors) new Notice(`Could not ${what}: ${error.message}`);
+  }
+}
+
+function copyTextToClipboard(text, notice) {
+  navigator.clipboard
+    .writeText(text)
+    .then(() => new Notice(notice))
+    .catch(() => new Notice(text));
+}
+
+function openInFileManagerLabel() {
+  if (process.platform === "darwin") return "Open in Finder";
+  if (process.platform === "win32") return "Open in Explorer";
+  return "Open in file manager";
+}
+
+// Opens the OS file manager at an absolute directory (Finder, Explorer,
+// or whatever xdg-open hands off to).
+function openDirectoryInFileManager(directory) {
+  if (process.platform === "darwin") {
+    spawnHelperBinary("open", [directory], `open ${directory} in Finder`);
+    return;
+  }
+  if (process.platform === "win32") {
+    // explorer.exe exits with code 1 even on success and reports real
+    // errors (missing path, …) in its own dialog — ignore result noise.
+    spawnHelperBinary("explorer", [directory], "", { ignoreErrors: true });
+    return;
+  }
+  spawnHelperBinary("xdg-open", [directory], `open ${directory} in the file manager`);
+}
+
+// Linux terminal candidates: name → argv builder for the working directory.
+// Probed in order after an optional $TERMINAL override.
+const LINUX_TERMINALS = [
+  ["gnome-terminal", (dir) => [`--working-directory=${dir}`]],
+  ["konsole", (dir) => ["--workdir", dir]],
+  ["xfce4-terminal", (dir) => [`--working-directory=${dir}`]],
+  ["kitty", (dir) => ["--directory", dir]],
+  ["alacritty", (dir) => ["--working-directory", dir]],
+  ["wezterm", (dir) => ["start", "--cwd", dir]],
+  ["x-terminal-emulator", (dir) => [`--working-directory=${dir}`]],
+];
+
+// Resolves an executable name against $PATH (absolute paths are checked
+// directly); null when not found. statSync per PATH entry — a handful of
+// sync stats at menu-click time is fine.
+function resolveOnPath(name) {
+  if (name.includes(path.sep)) {
+    try {
+      return fs.statSync(name).isFile() ? name : null;
+    } catch {
+      return null;
+    }
+  }
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      if (fs.statSync(path.join(dir, name)).isFile()) return path.join(dir, name);
+    } catch {
+      // not present in this PATH entry
+    }
+  }
+  return null;
+}
+
+// Opens a terminal window cd'd to an absolute directory: `open -a Terminal`
+// on macOS, `cmd /K cd /d` on Windows, and on Linux the $TERMINAL override
+// or the first common emulator found on PATH.
+function openDirectoryInTerminal(directory) {
+  if (process.platform === "darwin") {
+    spawnHelperBinary("open", ["-a", "Terminal", directory], `open a Terminal at ${directory}`);
+    return;
+  }
+  if (process.platform === "win32") {
+    spawnHelperBinary(
+      "cmd.exe",
+      ["/c", "start", "", "cmd", "/K", `cd /d ${directory}`],
+      `open a terminal at ${directory}`,
+    );
+    return;
+  }
+  const candidates = process.env.TERMINAL
+    ? [[process.env.TERMINAL, (dir) => [`--working-directory=${dir}`]], ...LINUX_TERMINALS]
+    : LINUX_TERMINALS;
+  for (const [name, buildArgs] of candidates) {
+    const resolved = resolveOnPath(name);
+    if (!resolved) continue;
+    spawnHelperBinary(resolved, buildArgs(directory), `open a terminal at ${directory}`);
+    return;
+  }
+  new Notice("Could not open a terminal: no known emulator found (set $TERMINAL).");
+}
+
+// Shared "working directory" section for ⋮ menus: a disabled label item
+// showing the target directory, then copy / open-in-file-manager /
+// open-in-terminal. Empty directory (session not loaded yet) disables the
+// actions but keeps the section visible. `withSeparator` draws the rule
+// that separates it from preceding chat actions.
+function appendDirectoryMenuItems(menu, directory, withSeparator = true) {
+  if (withSeparator) menu.addSeparator();
+  const dir = String(directory || "").trim();
+  menu.addItem((item) =>
+    item.setTitle(dir || "No working directory").setIcon("folder").setDisabled(true),
+  );
+  menu.addItem((item) =>
+    item
+      .setTitle("Copy path")
+      .setIcon("copy")
+      .setDisabled(!dir)
+      .onClick(() => copyTextToClipboard(dir, "Copied working-directory path")),
+  );
+  menu.addItem((item) =>
+    item
+      .setTitle(openInFileManagerLabel())
+      .setIcon("folder-open")
+      .setDisabled(!dir)
+      .onClick(() => openDirectoryInFileManager(dir)),
+  );
+  menu.addItem((item) =>
+    item
+      .setTitle("Open in terminal")
+      .setIcon("terminal")
+      .setDisabled(!dir)
+      .onClick(() => openDirectoryInTerminal(dir)),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4286,15 +4436,9 @@ class SessionChatView extends ItemView {
       text: "",
     });
     // Action block, anchored to the right edge of the header row:
-    // <Copy ID> <Refresh (icon)> <Notes (icon)>.
+    // <Find (icon)> <Notes (icon)> <More (⋮: Copy ID, Refresh, and
+    // working-directory operations)>.
     const headerActions = titleRow.createDiv({ cls: "oc-header-actions" });
-    this.copyButton = headerActions.createEl("button", { cls: "oc-icon-button", text: "Copy ID" });
-    this.copyButton.addEventListener("click", () => {
-      navigator.clipboard
-        .writeText(this.sessionId)
-        .then(() => new Notice("Copied session ID"))
-        .catch(() => new Notice(this.sessionId));
-    });
     this.findButton = headerActions.createEl("button", {
       cls: "oc-icon-button oc-find-toggle",
       attr: {
@@ -4304,12 +4448,6 @@ class SessionChatView extends ItemView {
     });
     setIcon(this.findButton, "search");
     this.findButton.addEventListener("click", () => this.openFind());
-    this.refreshButton = headerActions.createEl("button", {
-      cls: "oc-icon-button oc-refresh",
-      attr: { "aria-label": "Refresh", title: "Refresh" },
-    });
-    setIcon(this.refreshButton, "rotate-cw");
-    this.refreshButton.addEventListener("click", () => this.refresh(true));
     this.notesButton = headerActions.createEl("button", {
       cls: "oc-icon-button oc-notes-toggle",
       attr: { "aria-label": "Session notes" },
@@ -4317,6 +4455,12 @@ class SessionChatView extends ItemView {
     setIcon(this.notesButton, "sticky-note");
     this.notesButton.style.display = "none";
     this.notesButton.addEventListener("click", () => this.toggleNotes());
+    this.moreButton = headerActions.createEl("button", {
+      cls: "oc-icon-button oc-more",
+      attr: { "aria-label": "More actions", title: "More actions" },
+    });
+    setIcon(this.moreButton, "more-vertical");
+    this.moreButton.addEventListener("click", (event) => this.showHeaderMenu(event));
     this.metaEl = header.createDiv({ cls: "oc-meta", text: "Loading…" });
     this.offlineEl = header.createDiv({ cls: "oc-offline", text: "" });
     this.offlineEl.style.display = "none";
@@ -5184,7 +5328,31 @@ class SessionChatView extends ItemView {
     }
   }
 
-  // Manual + automatic refresh entry points (header button, tab focus,
+  // Header ⋮ menu: chat actions (Copy ID, Refresh) plus the shared
+  // working-directory section. Drafts have no id yet — those entries stay
+  // disabled until the first message creates the session.
+  showHeaderMenu(event) {
+    const menu = new Menu();
+    const draft = this.isDraft();
+    menu.addItem((item) =>
+      item
+        .setTitle("Copy ID")
+        .setIcon("copy")
+        .setDisabled(draft || !this.sessionId)
+        .onClick(() => copyTextToClipboard(this.sessionId, "Copied session ID")),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Refresh")
+        .setIcon("rotate-cw")
+        .setDisabled(draft)
+        .onClick(() => this.refresh(true)),
+    );
+    appendDirectoryMenuItems(menu, this.session?.location?.directory || this.draftDirectory || "");
+    menu.showAtMouseEvent(event);
+  }
+
+  // Manual + automatic refresh entry points (⋮ menu, tab focus,
   // stream reconnect, layout-ready). Full reload when idle; non-destructive
   // upsert when streaming so live deltas are not clobbered.
   async refresh(manual = false) {
@@ -5195,17 +5363,17 @@ class SessionChatView extends ItemView {
       return;
     }
     this.refreshing = true;
-    if (this.refreshButton) {
-      this.refreshButton.disabled = true;
-      this.refreshButton.addClass("oc-busy");
+    if (this.moreButton) {
+      this.moreButton.disabled = true;
+      this.moreButton.addClass("oc-busy");
     }
     try {
       await this.loadInitial();
     } finally {
       this.refreshing = false;
-      if (this.refreshButton) {
-        this.refreshButton.disabled = false;
-        this.refreshButton.removeClass("oc-busy");
+      if (this.moreButton) {
+        this.moreButton.disabled = false;
+        this.moreButton.removeClass("oc-busy");
       }
     }
   }
@@ -6571,6 +6739,21 @@ class NewSessionView extends ItemView {
       titleWrap.createSpan({
         cls: "opencode-sessions-card-title",
         text: directory === this.plugin.vaultRoot ? "This vault" : path.basename(directory) || directory,
+      });
+      // Per-card ⋮: the same working-directory section as the chat header —
+      // copy/open/terminal a candidate directory before picking it. The card
+      // itself is the click target, so the button stops propagation.
+      const headRight = head.createSpan({ cls: "opencode-sessions-card-head-right" });
+      const menuButton = headRight.createEl("button", {
+        cls: "opencode-sessions-card-menu",
+        attr: { "aria-label": "Directory actions", title: "Directory actions" },
+      });
+      setIcon(menuButton, "more-vertical");
+      menuButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const menu = new Menu();
+        appendDirectoryMenuItems(menu, directory, false);
+        menu.showAtMouseEvent(event);
       });
       card.createDiv({
         cls: "opencode-sessions-card-meta",

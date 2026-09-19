@@ -280,6 +280,24 @@
   color: var(--text-accent);
 }
 
+/* Kebab (⋮) button on new-session picker cards: opens the directory
+ * actions menu — same quiet-icon treatment as the note button. The card
+ * is the click target, so the button stops propagation in JS. */
+.opencode-sessions-card-menu {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.opencode-sessions-card-menu:hover {
+  color: var(--text-accent);
+}
+
 .opencode-sessions-table .opencode-sessions-note-button {
   margin-left: 0.35rem;
   vertical-align: middle;
@@ -448,7 +466,7 @@
   gap: 0.6rem;
 }
 
-/* Action block (Copy ID · Refresh · Notes) pinned to the right edge; the
+/* Action block (Find · Notes · More) pinned to the right edge; the
  * title/chip/badge keep the left. */
 .oc-header-actions {
   margin-left: auto;
@@ -458,8 +476,9 @@
   flex-shrink: 0;
 }
 
-/* Icon refresh button: spins while a refresh is in flight. */
-.oc-refresh.oc-busy svg {
+/* Kebab (⋮) button: spins while a refresh triggered from its menu is in
+ * flight. */
+.oc-more.oc-busy svg {
   animation: oc-spin 0.9s linear infinite;
 }
 
