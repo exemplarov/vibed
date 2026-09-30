@@ -1,8 +1,8 @@
 # Vibed 0.15.0 — subsession hierarchy
 
-**Date:** 2026-09-30
+**Date:** 2026-09-30 (released 2026-10-01)
 **Scope:** `main.js`, `styles.css`, `scripts/dashboard-smoke.js`, `manifest.json`, `README.md`
-**Commit:** d67ba03 (installed to `~/vaults/loomp-os`, awaiting Roman's test before release tag)
+**Commits:** d67ba03, 4b3f23f — released as [0.15.0](https://github.com/exemplarov/vibed/releases/tag/0.15.0)
 
 ## What was built
 
@@ -23,4 +23,4 @@ Task-tool subagent sessions ("subsessions", `session_v2.parent_id` / API `parent
 ## Notes
 
 - Live updates: `session.created` / `execution.*` / `form.*` events already trigger the debounced list reload, so children appear and states flip without new event plumbing.
-- Release: tag `0.15.0` after Roman's vault test — same flow as 0.14.0.
+- 2026-10-01: confirmed live by Roman — two `general` subagents ran `sleep 30` from this very session while he watched the card (badge, strip, child-chat chip, expand toggle all verified). Released 0.15.0. The overnight store-update collision (Obsidian updater overwrote the dev sync with release 0.14.0) resolved: vault clone reset to origin/main, store and vault now both at 0.15.0, `.hotreload` marker in place.
