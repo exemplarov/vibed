@@ -42,3 +42,8 @@ Beta-compat removals per Roman's call: the question REST protocol (`sessionQuest
 
 - Auth on released v2 is Basic (`opencode:<password>`) or `?auth_token=` query param — Bearer is rejected 401. Vibed already sent Basic.
 - The published https://opencode.ai/v2 openapi now tracks master, which is slightly ahead of installed releases (it still lists no question REST routes; question events return as `question.v2.*` there). Vibed targets installed release builds.
+
+## Outcome
+
+- Installed to `~/vaults/loomp-os` via `sync-plugins.sh` — Roman confirmed it works in the vault (live sessions OK against opencode 2.0.20).
+- Released: https://github.com/exemplarov/vibed/releases/tag/0.14.0 (tag `0.14.0`, workflow succeeded, assets attested).
