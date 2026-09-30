@@ -24,6 +24,7 @@ const ENDPOINT_CACHE_MS = 30 * 1000;
 
 const STATE_LABELS = {
   running: "Running…",
+  delegating: "Subagents running",
   suspended: "Suspended",
   idle: "Idle",
   waiting: "Needs approval",
@@ -32,6 +33,12 @@ const STATE_LABELS = {
   error: "Error",
   "": "",
 };
+
+// Session states that mean "work is in flight" — used to spot active
+// subsessions and to derive the parent's delegating state. OpenCode has no
+// dedicated server status for "waiting on a subagent" (parent and child both
+// read as running), so the signal is derived client-side.
+const ACTIVE_STATES = new Set(["running", "delegating", "waiting", "question"]);
 
 // ---------------------------------------------------------------------------
 // Connectors. A connector is one named instance of a backend — the local
@@ -1647,6 +1654,7 @@ class OpenCode2Driver extends ConnectorDriver {
     return this.plugin.decorateRow(
       {
         id: session.id,
+        parent_id: session.parentID || null,
         directory: session.location?.directory || "",
         title: session.title || null,
         agent: session.agent || "",
@@ -1694,6 +1702,7 @@ class OpenCode2Driver extends ConnectorDriver {
     );
     const fields = [
       "id",
+      "parent_id",
       "directory",
       "title",
       "model",
@@ -3467,6 +3476,9 @@ class SessionsDashboard {
     this.filterMenuEl = null;
     this.filterMenuDismiss = null;
     this.visible = DEFAULT_PAGE_SIZE;
+    // Parents whose subsession list is expanded (show all instead of active
+    // only). Keyed by parent session id; reset naturally on reload.
+    this.expandedSubs = new Set();
     this.disposed = false;
     // Connectors are referenced by name in block configs; omitting one uses
     // the default connector. An unknown name is a visible error, not a
@@ -3708,7 +3720,12 @@ class SessionsDashboard {
       for (const tag of tags) {
         if (!this.sessionHasTag(session, tag.toLowerCase())) return false;
       }
-      if (states.length && !states.includes(String(session.state || "").toLowerCase())) {
+      // `delegating` is a running parent supervising subsessions — it should
+      // keep matching is:running (and its own is:delegating).
+      const stateKey = String(session.state || "").toLowerCase();
+      const stateMatches =
+        states.includes(stateKey) || (stateKey === "delegating" && states.includes("running"));
+      if (states.length && !stateMatches) {
         return false;
       }
       if (dirs.length) {
@@ -3744,7 +3761,7 @@ class SessionsDashboard {
 
   render() {
     if (this.disposed || !this.listEl) return;
-    const filtered = this.filteredSessions();
+    const filtered = this.groupSubsessions(this.filteredSessions());
     const sessionsOnly = this.sessionsOnlyMode();
     // Widget mode shows everything listed; paginated mode never truncates
     // the pinned rows off the first page.
@@ -3786,6 +3803,115 @@ class SessionsDashboard {
       .writeText(sessionId)
       .then(() => new Notice(`Copied ${sessionId}`))
       .catch(() => new Notice(sessionId));
+  }
+
+  // ----- subsession hierarchy ------------------------------------------------
+
+  // Groups task-tool subsessions under their parent row: children disappear
+  // from the top level and attach as `row.subsessions` (oldest first) with a
+  // live count of active ones in `row.subsessionsActive`. Children whose
+  // parent is not in the current rows (filtered-out directory, pinned
+  // widget) stay top-level so nothing is silently dropped. A running parent
+  // with active children is re-stated as "delegating" — OpenCode has no
+  // dedicated server status for it, so the signal is derived here.
+  groupSubsessions(rows) {
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const byParent = new Map();
+    const nested = new Set();
+    for (const row of rows) {
+      const parentId = row.parent_id || row.parentID || null;
+      if (!parentId || !byId.has(parentId) || parentId === row.id) continue;
+      nested.add(row.id);
+      if (!byParent.has(parentId)) byParent.set(parentId, []);
+      byParent.get(parentId).push(row);
+    }
+    if (!nested.size) return rows;
+    const top = [];
+    for (const row of rows) {
+      if (nested.has(row.id)) continue;
+      // Idempotence: render() can re-group the same row objects (expand
+      // toggles re-render without a reload), so the pre-derivation state is
+      // kept aside and every pass derives from it fresh.
+      if (row.rawState === undefined) row.rawState = row.state;
+      const children = byParent.get(row.id);
+      if (children) {
+        row.subsessions = [...children].sort(
+          (a, b) => Number(a.time_created || 0) - Number(b.time_created || 0),
+        );
+        row.subsessionsActive = row.subsessions.filter((child) => this.subsessionActive(child)).length;
+        if (row.rawState === "running" && row.subsessionsActive > 0) {
+          row.state = "delegating";
+          row.stateLabel = STATE_LABELS.delegating;
+        } else {
+          row.state = row.rawState;
+          row.stateLabel = STATE_LABELS[row.rawState] || "";
+        }
+      } else {
+        row.subsessions = [];
+        row.subsessionsActive = 0;
+        row.state = row.rawState;
+        row.stateLabel = STATE_LABELS[row.rawState] || "";
+      }
+      top.push(row);
+    }
+    return top;
+  }
+
+  subsessionActive(row) {
+    return ACTIVE_STATES.has(String(row.state || "").toLowerCase());
+  }
+
+  // The subsession strip for a card (or a table sub-row cell): collapsed it
+  // lists only active subsessions, expanded all of them. The header line
+  // always shows counts and toggles.
+  renderSubsessions(container, session) {
+    const subs = session.subsessions;
+    if (!subs || !subs.length) return;
+    const active = subs.filter((child) => this.subsessionActive(child));
+    const expanded = this.expandedSubs.has(session.id);
+    const shown = expanded ? subs : active;
+    const wrap = container.createDiv({ cls: "opencode-sessions-subs" });
+    const head = wrap.createDiv({ cls: "opencode-sessions-subs-head" });
+    const toggle = () => {
+      if (this.expandedSubs.has(session.id)) this.expandedSubs.delete(session.id);
+      else this.expandedSubs.add(session.id);
+      this.render();
+    };
+    const chevron = head.createSpan({
+      cls: "opencode-sessions-subs-chevron",
+      text: expanded ? "▾" : "▸",
+    });
+    head.createSpan({
+      cls: `opencode-sessions-subs-label${active.length ? " oc-subs-active" : ""}`,
+      text: active.length
+        ? `${active.length} of ${subs.length} subagent${subs.length === 1 ? "" : "s"} running`
+        : `${subs.length} subagent${subs.length === 1 ? "" : "s"} · finished`,
+    });
+    head.title = expanded ? "Show only running subsessions" : "Show all subsessions";
+    head.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggle();
+    });
+    chevron.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggle();
+    });
+    for (const child of shown) {
+      const entry = wrap.createDiv({
+        cls: `opencode-sessions-sub opencode-sessions-sub-${child.state || "none"}`,
+      });
+      entry.title = `Open subsession · ${child.stateLabel || child.state || ""}`;
+      entry.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.plugin.openSession({ connectorId: this.connectorId, sessionId: child.id });
+      });
+      entry.createSpan({ cls: "opencode-sessions-sub-dot" });
+      entry.createSpan({ cls: "opencode-sessions-sub-title", text: child.titleLabel });
+      entry.createSpan({
+        cls: "opencode-sessions-sub-meta",
+        text: [child.agent, child.modelLabel].filter(Boolean).join(" · "),
+      });
+    }
   }
 
   // ----- filtering -------------------------------------------------------------
@@ -3994,6 +4120,7 @@ class SessionsDashboard {
       });
       if (session.tokensLabel) sub.appendText(` · ${session.tokensLabel} tokens`);
       this.renderTagChips(sub, session);
+      this.renderSubsessions(card, session);
     }
   }
 
@@ -4046,6 +4173,14 @@ class SessionsDashboard {
         this.copyId(session.id);
       });
       this.renderTagChips(idCell, session);
+      if (session.subsessions && session.subsessions.length) {
+        const subRow = body.createEl("tr", { cls: "opencode-sessions-table-subrow" });
+        const cell = subRow.createEl("td", {
+          cls: "opencode-sessions-table-subcell",
+          attr: { colspan: "8" },
+        });
+        this.renderSubsessions(cell, session);
+      }
     }
   }
 }
@@ -4348,6 +4483,20 @@ class SessionChatView extends ItemView {
     // connector (e.g. a remote OpenCode server).
     this.connectorChipEl = titleRow.createSpan({ cls: "oc-connector-chip", text: "" });
     this.connectorChipEl.style.display = "none";
+    // Subsession link: shown when this session is a task-tool child — jumps
+    // to its parent ("main") session in the same connector.
+    this.parentLinkEl = titleRow.createEl("button", {
+      cls: "oc-parent-link",
+      attr: { "aria-label": "Open main session", title: "This is a subsession — open the main session" },
+    });
+    setIcon(this.parentLinkEl, "git-branch");
+    this.parentLinkEl.createSpan({ cls: "oc-parent-link-text", text: "subsession" });
+    this.parentLinkEl.style.display = "none";
+    this.parentLinkEl.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const parentId = this.parentSessionId();
+      if (parentId) this.plugin.openSession({ connectorId: this.connectorId, sessionId: parentId });
+    });
     this.badgeEl = titleRow.createSpan({
       cls: "opencode-sessions-badge opencode-sessions-badge-none",
       text: "",
@@ -4636,6 +4785,13 @@ class SessionChatView extends ItemView {
     this.badgeEl.setText(STATE_LABELS[state] || "");
   }
 
+  // This session's parent id (task-tool subsessions); null for main
+  // sessions. API sessions carry parentID, the offline DB fallback
+  // parent_id — both normalize here.
+  parentSessionId() {
+    return this.session?.parentID || this.session?.parent_id || null;
+  }
+
   renderHeader() {
     this.updateNotesChrome();
     const defaultName = this.plugin.registry?.defaultConnector()?.connector.name;
@@ -4659,6 +4815,14 @@ class SessionChatView extends ItemView {
       return;
     }
     this.titleEl.setText(this.session.title || "Untitled session");
+    // Subsession indicator: API sessions carry parentID, the offline DB
+    // fallback parent_id — parentSessionId() normalizes both.
+    if (this.parentLinkEl) {
+      this.parentLinkEl.style.display = this.parentSessionId() ? "" : "none";
+      this.parentLinkEl.title = this.parentSessionId()
+        ? `Subsession — open main session (${this.parentSessionId()})`
+        : "";
+    }
     const model = this.session.model ? modelLabel(this.session.model) : "";
     const tokens = formatTokens(this.session.tokens);
     const cost = Number(this.session.cost || 0);
@@ -5330,6 +5494,7 @@ class SessionChatView extends ItemView {
       if (row) {
         this.session = {
           id: row.id,
+          parentID: row.parent_id || null,
           title: row.title,
           agent: row.agent || "",
           model: row.model || null,

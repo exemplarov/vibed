@@ -76,6 +76,12 @@ function makeEl(tag, opts = {}) {
 const rows = [
   { id: "ses_1", titleLabel: "Fix parser", stateLabel: "Idle", state: "idle", directoryLabel: "proj", directory: "/x/proj", modelLabel: "Sonnet 4.5", model: "anthropic/sonnet-4-5", agent: "build", tokensLabel: "1k", updatedLabel: "now" },
   { id: "ses_2", titleLabel: "Deploy", stateLabel: "Running…", state: "running", directoryLabel: "proj", directory: "/x/proj", modelLabel: "GPT-5", model: "openai/gpt-5", agent: "build", tokensLabel: "2k", updatedLabel: "now" },
+  // Subsession family: ses_2 gains a running child + a finished one —
+  // grouping nests both under the parent and derives "delegating".
+  { id: "ses_2a", parent_id: "ses_2", titleLabel: "Review diff", stateLabel: "Running…", state: "running", directoryLabel: "proj", directory: "/x/proj", modelLabel: "GPT-5", model: "openai/gpt-5", agent: "explore", tokensLabel: "1k", updatedLabel: "now", time_created: 200 },
+  { id: "ses_2b", parent_id: "ses_2", titleLabel: "Old scan", stateLabel: "Idle", state: "idle", directoryLabel: "proj", directory: "/x/proj", modelLabel: "GPT-5", model: "openai/gpt-5", agent: "explore", tokensLabel: "1k", updatedLabel: "then", time_created: 100 },
+  // Orphan child (parent not listed) stays a top-level card.
+  { id: "ses_3", parent_id: "ses_gone", titleLabel: "Orphan", stateLabel: "Idle", state: "idle", directoryLabel: "proj", directory: "/x/proj", modelLabel: "GPT-5", model: "openai/gpt-5", agent: "build", tokensLabel: "1k", updatedLabel: "then", time_created: 50 },
 ];
 const driver = {
   capabilities: () => ({ listing: "db", live: "sse", chat: true }),
@@ -128,8 +134,9 @@ const check = (name, fn) => {
     const dash = new SessionsDashboard(plugin, container, {});
     const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("load never settled")), 3000));
     await Promise.race([dash.mount(), timeout]);
+    // 3 top-level sessions (parent absorbs its 2 children; orphan stays).
     const status = (findStatus(container) || {})._text;
-    if (!/2 of 2 sessions/.test(status || "")) throw new Error(`unexpected status: ${status}`);
+    if (!/3 of 5 sessions/.test(status || "")) throw new Error(`unexpected status: ${status}`);
   });
 
   await check("widget mode (pinned sessions) mounts", async () => {
@@ -158,6 +165,41 @@ const check = (name, fn) => {
     dash.moreButton = makeEl("button");
     dash.filterQuery = { tags: [] }; // old shape — regression guard for v0.11.0
     dash.render();
+  });
+
+  check("subsessions nest under the parent and derive delegating state", () => {
+    const container = makeEl("div");
+    const dash = new SessionsDashboard(plugin, container, {});
+    dash.sessions = rows;
+    dash.listEl = makeEl("div");
+    dash.errorEl = makeEl("div");
+    dash.moreButton = makeEl("button");
+    dash.statusEl = makeEl("span");
+    dash.filterQuery = { tags: [], states: [], dirs: [], models: [], phrases: [] };
+    dash.render();
+    // Three cards: parent absorbed both children; orphan stays top-level.
+    const walk = (el, out) => {
+      for (const child of el.children || []) {
+        if (child._text) out.push(child._text);
+        walk(child, out);
+      }
+    };
+    const texts = [];
+    walk(dash.listEl, texts);
+    if (!texts.includes("Deploy")) throw new Error("parent card missing");
+    if (texts.includes("Review diff") === false) throw new Error("active subsession not listed");
+    if (texts.includes("Old scan")) throw new Error("finished subsession visible while collapsed");
+    if (!texts.some((t) => /1 of 2 subagents running/.test(t))) throw new Error("subs summary missing");
+    if (!texts.includes("Subagents running")) throw new Error("delegating state label missing");
+    // Expand: all children now listed.
+    dash.expandedSubs.add("ses_2");
+    dash.render();
+    const texts2 = [];
+    walk(dash.listEl, texts2);
+    if (!texts2.includes("Old scan")) throw new Error("expand does not show finished subsession");
+    if (!texts2.some((t) => /1 of 2 subagents running/.test(t))) throw new Error("subs summary missing after expand");
+    // Orphan child still rendered as its own card.
+    if (!texts2.includes("Orphan")) throw new Error("orphan subsession dropped");
   });
 
   fs.unlinkSync(tmp);

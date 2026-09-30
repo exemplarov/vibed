@@ -1298,3 +1298,161 @@
 .oc-send:disabled {
   opacity: 0.5;
 }
+
+/* ---------------------------------------------------------------------------
+ * Subsessions (task-tool subagents) — hierarchy in dashboards + chat header.
+ * ------------------------------------------------------------------------ */
+
+/* Parent supervising running subsessions: distinct from plain Running… —
+ * accent-tinted (the session itself is idle-ish, the work is delegated). */
+.opencode-sessions-badge-delegating {
+  color: var(--text-accent);
+  background: color-mix(in srgb, var(--text-accent) 12%, transparent);
+}
+
+.opencode-sessions-card-delegating {
+  border-color: color-mix(in srgb, var(--text-accent) 45%, var(--background-modifier-border));
+}
+
+.opencode-sessions-state-delegating {
+  color: var(--text-accent);
+  font-weight: var(--font-bold);
+}
+
+/* Subsession strip inside a card (and inside table sub-row cells). */
+.opencode-sessions-subs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-top: 0.35rem;
+  padding-top: 0.3rem;
+  border-top: 1px dashed var(--background-modifier-border);
+}
+
+.opencode-sessions-subs-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: var(--font-smallest);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  align-self: flex-start;
+  border-radius: var(--radius-s);
+  padding: 0.05rem 0.25rem;
+}
+
+.opencode-sessions-subs-head:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.opencode-sessions-subs-chevron {
+  color: var(--text-faint);
+  width: 0.8em;
+  display: inline-block;
+  text-align: center;
+}
+
+.opencode-sessions-subs-label.oc-subs-active {
+  color: var(--text-accent);
+}
+
+.opencode-sessions-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  font-size: var(--font-smaller);
+  padding: 0.12rem 0.3rem;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.opencode-sessions-sub:hover {
+  background: var(--background-modifier-hover);
+}
+
+.opencode-sessions-sub-dot {
+  flex-shrink: 0;
+  width: 0.45em;
+  height: 0.45em;
+  border-radius: 50%;
+  align-self: center;
+  background: var(--text-faint);
+}
+
+.opencode-sessions-sub-running .opencode-sessions-sub-dot,
+.opencode-sessions-sub-delegating .opencode-sessions-sub-dot {
+  background: var(--color-green);
+}
+
+.opencode-sessions-sub-waiting .opencode-sessions-sub-dot {
+  background: var(--color-orange);
+}
+
+.opencode-sessions-sub-question .opencode-sessions-sub-dot {
+  background: var(--color-purple);
+}
+
+.opencode-sessions-sub-error .opencode-sessions-sub-dot,
+.opencode-sessions-sub-interrupted .opencode-sessions-sub-dot {
+  background: var(--color-red);
+}
+
+.opencode-sessions-sub-title {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.opencode-sessions-sub:hover .opencode-sessions-sub-title {
+  color: var(--text-accent);
+}
+
+.opencode-sessions-sub-meta {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* Table layout: one indented sub-row under the parent row. */
+.opencode-sessions-table-subrow td {
+  padding-top: 0;
+  padding-bottom: 0.45rem;
+  cursor: default;
+}
+
+.opencode-sessions-table-subcell .opencode-sessions-subs {
+  margin-top: 0;
+  padding-top: 0.15rem;
+  border-top: none;
+}
+
+/* Chat header: "subsession" chip linking to the main session. */
+.oc-parent-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+  border: none;
+  box-shadow: none;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.oc-parent-link:hover {
+  color: var(--text-accent);
+}
+
+.oc-parent-link .oc-parent-link-text {
+  font-size: var(--font-ui-smaller);
+}
