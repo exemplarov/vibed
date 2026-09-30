@@ -1004,8 +1004,9 @@ class NodeSSE {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode v2 (beta) API client. Discovers the local server from
-// ~/.local/state/opencode/service.json, then talks to /api/* with Basic auth.
+// OpenCode v2 API client (released v2 servers). Discovers the local server
+// from ~/.local/state/opencode/service.json, then talks to /api/* with Basic
+// auth.
 // ---------------------------------------------------------------------------
 
 class OpenCodeClient {
@@ -1022,19 +1023,18 @@ class OpenCodeClient {
   invalidate() {
     this.endpoint = null;
     this.endpointAt = 0;
-    // The form/question protocol is a property of the *server*; a repointed
-    // URL or an in-place server upgrade can flip it — re-probe after reset.
-    this.questionProtocol = undefined;
   }
 
   static async probe(baseUrl, password, timeoutMs = 2500) {
     try {
       const headers = { accept: "application/json" };
       if (password) headers.authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
-      const res = await nodeRequest(`${baseUrl.replace(/\/+$/, "")}/api/health`, { headers, timeoutMs });
+      // Released v2 servers identify themselves via /api/info ({version,
+      // pid, urls}); the beta /api/health probe no longer exists.
+      const res = await nodeRequest(`${baseUrl.replace(/\/+$/, "")}/api/info`, { headers, timeoutMs });
       if (res.status !== 200) return null;
       const body = JSON.parse(res.body || "null");
-      return body && body.healthy ? body : null;
+      return body && body.version ? body : null;
     } catch {
       return null;
     }
@@ -1078,7 +1078,7 @@ class OpenCodeClient {
     throw new Error(
       overrideUrl
         ? `OpenCode v2 server not reachable at ${overrideUrl}`
-        : "OpenCode v2 server not found (no /api/health responded)",
+        : "OpenCode v2 server not found (no /api/info responded)",
     );
   }
 
@@ -1113,7 +1113,7 @@ class OpenCodeClient {
   }
 
   health() {
-    return this.request("/api/health", { timeoutMs: 4000 });
+    return this.request("/api/info", { timeoutMs: 4000 });
   }
 
   session(sessionId) {
@@ -1179,18 +1179,16 @@ class OpenCodeClient {
   replyPermission(sessionId, requestId, reply) {
     return this.request(
       `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
-      { method: "POST", body: { reply } },
+      // Released v2 field is `decision` ("once" | "always" | "reject").
+      { method: "POST", body: { decision: reply } },
     );
   }
 
   // ----- agent questions (the `question` tool) -------------------------------
   //
-  // Two server generations expose these differently; both are normalized:
-  //  - "form": GET /api/session/:id/form + reply/cancel — the question tool
-  //    surfaces as a form with fields q0, q1, … (answers keyed by field)
-  //  - "question": GET /api/session/:id/question + reply/reject — newer v2
-  //    servers (answers ordered per question, each an array of labels)
-  // The available protocol is probed once per server and cached.
+  // Released v2 servers surface the question tool through the form API:
+  // GET /api/session/:id/form + reply/cancel. The question arrives as a
+  // form with fields q0, q1, … (answers keyed by field).
 
   sessionForms(sessionId) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/form`);
@@ -1210,54 +1208,12 @@ class OpenCodeClient {
     );
   }
 
-  sessionQuestions(sessionId) {
-    return this.request(`/api/session/${encodeURIComponent(sessionId)}/question`);
-  }
-
-  replyQuestionRequest(sessionId, requestId, answers) {
-    return this.request(
-      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reply`,
-      { method: "POST", body: { answers } },
-    );
-  }
-
-  rejectQuestionRequest(sessionId, requestId) {
-    return this.request(
-      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reject`,
-      { method: "POST" },
-    );
-  }
-
   // Pending question batches normalized to one shape:
   // { protocol, id, sessionID, title, questions: [{ key, header, question,
   //   multiple, boolean, numeric, external, custom,
   //   options: [{ label, value, description }] }] }
   async pendingQuestions(sessionId) {
-    if (this.questionProtocol === "question") {
-      return this.normalizeQuestionRequests(await this.sessionQuestions(sessionId));
-    }
-    if (this.questionProtocol === "form") {
-      return this.normalizeForms(await this.sessionForms(sessionId));
-    }
-    if (this.questionProtocol === "unsupported") return [];
-    try {
-      const forms = await this.sessionForms(sessionId);
-      this.questionProtocol = "form";
-      return this.normalizeForms(forms);
-    } catch (error) {
-      if (!String(error.message).startsWith("404")) throw error;
-      try {
-        const questions = await this.sessionQuestions(sessionId);
-        this.questionProtocol = "question";
-        return this.normalizeQuestionRequests(questions);
-      } catch (questionError) {
-        if (!String(questionError.message).startsWith("404")) throw questionError;
-        // Neither endpoint exists (older v2 build) — negative-cache instead
-        // of double-probing on every refresh.
-        this.questionProtocol = "unsupported";
-        return [];
-      }
-    }
+    return this.normalizeForms(await this.sessionForms(sessionId));
   }
 
   normalizeForms(response) {
@@ -1284,41 +1240,9 @@ class OpenCodeClient {
     }));
   }
 
-  normalizeQuestionRequests(response) {
-    return (response?.data || []).filter(Boolean).map((request) => ({
-      protocol: "question",
-      id: request.id,
-      sessionID: request.sessionID || "",
-      title: "Questions",
-      questions: (request.questions || []).map((question, index) => ({
-        key: `q${index}`,
-        header: question.header || `Question ${index + 1}`,
-        question: question.question || "",
-        multiple: question.multiple === true,
-        boolean: false,
-        numeric: false,
-        external: false,
-        custom: question.custom !== false,
-        options: (question.options || []).map((option) => ({
-          label: option.label,
-          value: option.label,
-          description: option.description || "",
-        })),
-      })),
-    }));
-  }
-
   // Submits normalized answers (question key -> option value(s), custom text,
-  // boolean, or number) using the protocol the request was loaded with.
+  // boolean, or number) keyed by form field.
   async replyPendingQuestions(sessionId, pending, answers) {
-    if (pending.protocol === "question") {
-      const ordered = pending.questions.map((question) => {
-        const value = answers.get(question.key);
-        if (Array.isArray(value)) return value;
-        return value === undefined || value === "" ? [] : [value];
-      });
-      return this.replyQuestionRequest(sessionId, pending.id, ordered);
-    }
     const answer = {};
     for (const question of pending.questions) {
       // External fields are an acknowledgement (OAuth/integration flows):
@@ -1330,9 +1254,7 @@ class OpenCodeClient {
 
   // Rejects a pending batch: the tool call fails and the session continues.
   async dismissPendingQuestions(sessionId, pending) {
-    return pending.protocol === "question"
-      ? this.rejectQuestionRequest(sessionId, pending.id)
-      : this.cancelForm(sessionId, pending.id);
+    return this.cancelForm(sessionId, pending.id);
   }
 
   prompt(sessionId, text) {
@@ -1636,19 +1558,14 @@ class OpenCode2Driver extends ConnectorDriver {
         this.setLiveState(sessionId, "error");
         break;
       case "permission.asked":
-      case "permission.v2.asked": // next-gen servers renamed the event
         this.setLiveState(sessionId, "waiting");
         break;
       case "form.created":
-      case "question.v2.asked":
         this.setLiveState(sessionId, "question");
         break;
       case "permission.replied":
-      case "permission.v2.replied":
       case "form.replied":
       case "form.cancelled":
-      case "question.v2.replied":
-      case "question.v2.rejected":
         // The agent loop resumes after a reply (answers continue the tool,
         // rejection fails it) — running until the execution result lands.
         this.setLiveState(sessionId, "running");
@@ -1744,8 +1661,8 @@ class OpenCode2Driver extends ConnectorDriver {
         tokens_output: tokens.output || 0,
         tokens_reasoning: tokens.reasoning || 0,
         // API rows carry no fallback-state hints; the event stream (or idle)
-        // decides. Note: this beta API exposes time.idle but NOT the
-        // suspend timestamp, so API rows never report "Suspended".
+        // decides. Note: the API exposes time.idle but NOT the suspend
+        // timestamp, so API rows never report "Suspended".
         last_assistant_time: null,
         last_assistant_completed: null,
         last_message_type: null,
@@ -5460,6 +5377,9 @@ class SessionChatView extends ItemView {
   // Creates or updates a message element. Returns the message record.
   upsertMessage(message) {
     if (!message || !message.id) return null;
+    // "idle" rows are internal run-lifecycle markers (carrying an outcome),
+    // not conversation content — released servers include them in listings.
+    if (message.type === "idle") return null;
     let record = this.messages.get(message.id);
     const json = JSON.stringify(this.stableMessage(message));
     if (record) {
@@ -5972,29 +5892,20 @@ class SessionChatView extends ItemView {
         this.finalizeStep(data);
         break;
       case "permission.asked":
-      case "permission.v2.asked": // next-gen servers renamed the event
         this.setPendingPermission(data);
         break;
       case "permission.replied":
-      case "permission.v2.replied":
         // Covers replies made anywhere (this banner, the TUI, elsewhere).
         this.clearPendingPermission(data?.requestID);
         break;
       case "form.created":
-        // Servers with the form API surface the question tool as a form;
-        // newer servers emit question.v2.* events instead.
+        // Released v2 servers surface the question tool as a form
+        // (metadata.kind === "question").
         this.setPendingQuestion(this.driver?.client?.normalizeForms({ data: [data.form] })[0] || null);
         break;
       case "form.replied":
       case "form.cancelled":
         this.clearPendingQuestion(data?.id);
-        break;
-      case "question.v2.asked":
-        this.setPendingQuestion(this.driver?.client?.normalizeQuestionRequests({ data: [data] })[0] || null);
-        break;
-      case "question.v2.replied":
-      case "question.v2.rejected":
-        this.clearPendingQuestion(data?.requestID);
         break;
       default:
         break;
@@ -6617,7 +6528,7 @@ class SessionChatView extends ItemView {
       this.upsertMessage({
         id: user?.id || `local-${Date.now()}`,
         type: "user",
-        time: { created: user?.timeCreated || Date.now() },
+        time: { created: user?.time?.created || Date.now() },
         text: user?.payload?.text || text,
       });
       this.setBusy(true);
@@ -6657,7 +6568,7 @@ class SessionChatView extends ItemView {
       this.upsertMessage({
         id: user?.id || `local-${Date.now()}`,
         type: "user",
-        time: { created: user?.timeCreated || Date.now() },
+        time: { created: user?.time?.created || Date.now() },
         text: user?.payload?.text || text,
       });
       this.setBusy(true);
@@ -7534,7 +7445,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     if (!driver) return;
     const type = String(event.type || "");
     const data = event.data || {};
-    if (type === "server.instance.disposed") {
+    if (type === "global.disposed") {
       driver.onServerDisposed();
       return;
     }
@@ -8018,22 +7929,19 @@ const LIST_REFRESH_EVENTS = new Set([
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+  "session.updated",
+  "session.status",
+  "session.idle",
   "session.renamed",
   "session.usage.updated",
   "session.inbox.enqueued",
   "session.inbox.delivered",
   "permission.asked",
   "permission.replied",
-  "permission.v2.asked",
-  "permission.v2.replied",
   "form.created",
   "form.replied",
   "form.cancelled",
-  "question.v2.asked",
-  "question.v2.replied",
-  "question.v2.rejected",
   "session.step.started",
   "session.step.ended",
   "session.deleted",
-  "session.removed",
 ]);

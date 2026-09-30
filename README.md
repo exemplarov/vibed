@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.13.0-blue)
+![version](https://img.shields.io/badge/version-0.14.0-blue)
 
 ## Connectors
 
@@ -71,7 +71,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Model selector**: defaults match OpenCode exactly — the last-used model *and* its persisted variant, falling back to the server's location-aware default; existing sessions switch live.
 - **Agent selector**: pick the session's agent (e.g. `build`, `plan`, custom agents) next to the model selector; hidden and subagent-only entries are filtered out, descriptions show on hover, and existing sessions switch live (drafts apply the choice at creation).
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
-- **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
+- **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Surfaced through the v2 form API.
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
 - **Session notes**: attach a markdown note to any session (every connector) — a side panel in the chat view with autosave, backed by a normal vault file found by `session:` frontmatter, not filename. See [Session notes](#session-notes).
 - **Session tags**: note tags (Obsidian semantics — frontmatter `tags:` + inline `#tags`) become session tags — editable in the notes panel, shown on cards, filterable (`#tag` in the filter, an advanced filter popover, and a `tags:` widget option). See [Session tags & filtering](#session-tags--filtering).
