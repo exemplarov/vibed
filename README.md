@@ -15,7 +15,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.15.0-blue)
+![version](https://img.shields.io/badge/version-0.16.0-blue)
 [![Obsidian community plugin](https://img.shields.io/badge/Obsidian-community%20plugin-7c3aed)](https://community.obsidian.md/plugins/vibed)
 
 ## Connectors
@@ -71,6 +71,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Find in chat**: `Ctrl+F` / `Cmd+F` opens a browser-style find bar over the transcript — live match count, all-matches highlighting, `Enter`/`Shift+Enter` (also `F3`, `Cmd/Ctrl+G`) to navigate with wrap-around, `Aa` toggles case sensitivity, `Esc` closes and restores focus. Searches exactly what's on screen: collapsed Thinking / tool Input / Output sections are skipped until you expand them (expanding re-runs the search live), and streaming or newly paged-in messages refresh the results automatically.
 - **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message. Each directory card carries a **⋮ menu** with the working-directory actions — copy path, open in the file manager, open in a terminal — so you can inspect a candidate before picking it.
+- **Snippet session config**: a `vibed` block can configure the sessions it starts — `model`/`agent`/`permissions`/`environment` per session, plus `skills`, `mcp`, `commands`, `agents`, `providers`, `references` as the desired config of the working directory. Matching config starts silently; a diff opens a dialogue to install (config merge + skill installers) or proceed as-is. See [Snippet session config](#snippet-session-config).
 - **Chat header menu**: the chat's ⋮ button gathers *Copy ID* and *Refresh* plus the same working-directory actions for the session's own directory.
 - **Model selector**: defaults match OpenCode exactly — the last-used model *and* its persisted variant, falling back to the server's location-aware default; existing sessions switch live.
 - **Agent selector**: pick the session's agent (e.g. `build`, `plan`, custom agents) next to the model selector; hidden and subagent-only entries are filtered out, descriptions show on hover, and existing sessions switch live (drafts apply the choice at creation).
@@ -139,8 +140,62 @@ Options (simple `key: value` lines or a JSON object):
 | `layout` | `cards` | `cards` or `table`. |
 | `pageSize` | plugin setting | Sessions per page. |
 | `title` | – | Optional heading above the dashboard. |
+| config keys | – | `model`, `agent`, `permissions`, `environment` (per session) and `skills`, `mcp`, `commands`, `agents`, `providers`, `references`, `default_agent` (desired directory config) — see [Snippet session config](#snippet-session-config). |
 
 Click a card (or table row) to open the live chat view; click a session ID to copy it. Sessions with an attached note show a sticky-note button on their card / title cell — click it to open the note file. Tagged sessions show tag chips next to the session ID — click one to filter by it.
+
+## Snippet session config
+
+A block can also configure the sessions it starts. Two key groups:
+
+- **Ephemeral** — `model` (`provider/model[#variant]`), `agent`,
+  `permissions`, `environment`: applied to every session created from the
+  block. Model and agent prefill the draft's selectors (you can still
+  change them); permissions and environment ride on session creation.
+  Never gated, never written to disk.
+- **Root state** — `skills`, `mcp`, `commands`, `agents`, `providers`,
+  `references`, `default_agent`: the desired OpenCode config of the
+  working directory. At session-start time (your first message) vibed
+  diffs them against the directory's live config — a match starts
+  silently; a diff opens a dialogue showing what's missing, with
+  **Install & start** (merge into `.opencode/opencode.json`, run skill
+  installers, reload the server config) or **Proceed as-is**. The
+  dialogue re-appears on every start while a diff exists — nothing about
+  your choice is remembered.
+
+````markdown
+```vibed
+connector: opencode
+dirs:
+  - ~/spaces/my-project
+model: zai/glm-5.3
+agent: build
+mcp: {"kangram": {"type": "remote", "url": "https://kangram.app/mcp"}}
+skills:
+  - ./skills/analysis
+  - {"id": "deep-research", "install": "npx skills add owner/repo"}
+```
+````
+
+Notes:
+
+- Install writes exactly two files in the target directory:
+  `.opencode/opencode.json` — deep-merged, user keys never deleted, with
+  an `x-vibed` marker tracking what vibed placed — and `.opencode/vibed.json`,
+  a manifest remembering which skills each install command produced (that
+  is how already-installed skills stay silent). Config files that cannot
+  be parsed (JSONC) are left alone with a clear message.
+- The dialogue never renders values read from your live config — they can
+  contain API keys. Only key paths, change kinds, and the snippet's own
+  declared values are shown. Don't put secrets in snippets; use
+  OpenCode's `{env:VAR}` substitution instead.
+- Skill installs are shell commands run in the working directory
+  (`npx skills add owner/repo`, …). Without a declared `id`, the first
+  consented install learns what the command produced; an edited command
+  re-asks. Closing the dialogue mid-install never kills a running
+  installer.
+- Install requires a local OpenCode server. Remote connectors show the
+  diff but can only proceed as-is.
 
 ## Linking to sessions
 
@@ -253,16 +308,21 @@ transparency, it does access:
 - **Files outside your vaults** (read-only): OpenCode v2/v1
   `~/.local/share/opencode/opencode.db`, Claude Code `~/.claude/projects/`,
   Codex `~/.codex/sessions/`, Cursor `~/.cursor/projects/` — that's where the
-  agent histories live. Nothing outside your vault is modified. The only
-  thing written anywhere: session notes you explicitly create, inside your
-  vault (see [Session notes](#session-notes)).
+  agent histories live. The only writes outside your vault happen through
+  [snippet session config](#snippet-session-config), after you click
+  *Install* in its dialogue: a merged `.opencode/opencode.json` plus a small
+  vibed manifest in the target directory, and the snippet's own skill
+  install commands run there. Inside your vault, the only thing written is
+  session notes you explicitly create (see [Session notes](#session-notes)).
 - **Local network**: the auto-discovered OpenCode v2 server
   (`~/.local/state/opencode/service.json`) for live streaming, chat, prompts,
   and approvals. With a remote *Server URL override*, the plugin talks to that
   host only — and nothing else.
 - **Helper binaries**: the system `sqlite3` binary (path configurable) and an
   optional `zstd` for Codex transcripts are spawned locally, detached — as are
-  the file-manager/terminal helpers behind the ⋮ menu's directory actions.
+  the file-manager/terminal helpers behind the ⋮ menu's directory actions and,
+  only through the snippet-config *Install* action, the shell commands a
+  block explicitly declares (e.g. `npx skills add …`).
 - **System clipboard** (write-only): used solely when you explicitly copy a session ID (clicking the ID on a card, or *Copy ID* in the chat's ⋮ menu) or a working-directory path (*Copy path* in the ⋮ menus). The clipboard is never read.
 - **Workspace directory actions**: the ⋮ menus (chat header, new-session picker cards) can open a session's working directory in the system file manager (`open` / `explorer` / `xdg-open`) or in a terminal (`open -a Terminal` on macOS, `cmd.exe` on Windows, your `$TERMINAL` or a common Linux emulator). These commands run only when you click those menu items.
 

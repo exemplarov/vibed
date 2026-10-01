@@ -1456,3 +1456,112 @@
 .oc-parent-link .oc-parent-link-text {
   font-size: var(--font-ui-smaller);
 }
+
+/* Snippet config diff dialogue (spec/007). Rows show a kind chip, the
+   dot-path of the desired change, and the snippet's own declared value —
+   never values read from the live config. */
+.oc-configdiff {
+  max-width: 560px;
+}
+
+.oc-configdiff-sub {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 0.75rem;
+}
+
+.oc-configdiff-sub code {
+  color: var(--text-normal);
+}
+
+.oc-configdiff-group {
+  margin: 0.5rem 0 0.9rem;
+}
+
+.oc-configdiff-title {
+  font-weight: var(--font-semibold);
+  font-size: var(--font-ui-small);
+  margin-bottom: 0.3rem;
+}
+
+.oc-configdiff-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+  font-size: var(--font-ui-smaller);
+}
+
+.oc-configdiff-kind {
+  flex-shrink: 0;
+  font-size: var(--font-ui-smallest);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.oc-configdiff-kind-add,
+.oc-configdiff-kind-install {
+  color: var(--color-green);
+  background: var(--background-modifier-hover);
+}
+
+.oc-configdiff-kind-change {
+  color: var(--color-orange);
+  background: var(--background-modifier-hover);
+}
+
+.oc-configdiff-path {
+  font-family: var(--font-monospace);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.oc-configdiff-value {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.oc-configdiff-note {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smallest);
+  margin-top: 0.25rem;
+}
+
+.oc-configdiff-log {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smallest);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  padding: 0.5rem 0.6rem;
+  max-height: 200px;
+  overflow-y: auto;
+  margin: 0.5rem 0;
+}
+
+.oc-configdiff-summary {
+  margin-top: 0.5rem;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.oc-configdiff-problems {
+  color: var(--color-red);
+}
+
+.oc-configdiff-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}

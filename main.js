@@ -4,7 +4,7 @@ const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
@@ -698,6 +698,22 @@ function displayDirectory(directory, vaultRoot) {
     : directory;
 }
 
+// Values and list items may be inline JSON — this is how nested config
+// (mcp servers, permissions rules, skill installs) is spelled in the
+// simple line format. Anything that does not parse stays a plain string,
+// so existing blocks are unaffected.
+function parseConfigValue(value) {
+  const text = String(value || "").trim();
+  if (text.startsWith("{") || text.startsWith("[")) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+  return text;
+}
+
 // Parses ```vibed block config: a JSON object, or simple
 // "key: value" lines with optional "- item" lists (e.g. dirs).
 function parseBlockConfig(source) {
@@ -716,7 +732,7 @@ function parseBlockConfig(source) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     if (line.startsWith("- ")) {
-      if (currentList) currentList.push(line.slice(2).trim());
+      if (currentList) currentList.push(parseConfigValue(line.slice(2)));
       continue;
     }
     const separator = line.indexOf(":");
@@ -728,7 +744,7 @@ function parseBlockConfig(source) {
       config[key] = currentList;
     } else {
       currentList = null;
-      config[key] = value;
+      config[key] = parseConfigValue(value);
     }
   }
   return config;
@@ -860,6 +876,254 @@ function upsertFrontmatterTags(frontmatter, tags) {
   while (end < lines.length && /^\s+-\s+/.test(lines[end])) end += 1;
   lines.splice(index + 1, end - (index + 1));
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Snippet session config. A vibed block may carry two groups of keys:
+// ephemeral ones (model, agent, permissions, environment) that ride on
+// POST /api/session every time, and "root state" ones (skills, commands,
+// agents, mcp, providers, references, default_agent) describing the
+// desired OpenCode config at the session root. Root state is diffed
+// against the live location at session-start time; a diff opens the
+// consent dialogue, a match starts silently. Spec: spec/007.
+// ---------------------------------------------------------------------------
+
+const SNIPPET_CONFIG_EPHEMERAL_KEYS = ["model", "agent", "permissions", "environment"];
+const SNIPPET_CONFIG_ROOT_KEYS = ["default_agent", "agents", "mcp", "providers", "commands", "references", "skills"];
+const VIBED_MARKER_KEY = "x-vibed";
+
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+// Splits a block's options into the snippet-config shape, or null when the
+// block carries none of the recognized keys (the unchanged-UX case).
+// Malformed skill entries throw — the caller surfaces a Notice.
+function extractSnippetSessionConfig(options) {
+  if (!isPlainObject(options)) return null;
+  const snippet = { ephemeral: {}, rootState: {}, installs: [] };
+  let any = false;
+  for (const key of SNIPPET_CONFIG_EPHEMERAL_KEYS) {
+    if (options[key] === undefined) continue;
+    any = true;
+    snippet.ephemeral[key] = options[key];
+  }
+  for (const key of SNIPPET_CONFIG_ROOT_KEYS) {
+    if (options[key] === undefined) continue;
+    any = true;
+    if (key === "skills") {
+      const sources = [];
+      const entries = Array.isArray(options.skills) ? options.skills : [options.skills];
+      for (const entry of entries) {
+        if (typeof entry === "string") {
+          if (entry.trim()) sources.push(entry.trim());
+          continue;
+        }
+        if (isPlainObject(entry) && typeof entry.install === "string" && entry.install.trim()) {
+          snippet.installs.push({
+            id: typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : null,
+            install: entry.install.trim(),
+          });
+          continue;
+        }
+        throw new Error("vibed config: skills entries must be source paths/URLs or {id, install} objects");
+      }
+      if (sources.length) snippet.rootState.skills = sources;
+    } else {
+      snippet.rootState[key] = options[key];
+    }
+  }
+  return any ? snippet : null;
+}
+
+// "provider/model[#variant]" or {providerID, model|id, variant} → the ref
+// shape POST /api/session accepts ({id, providerID, variant?}). Null when
+// the value is neither.
+function normalizeModelRef(value) {
+  if (isPlainObject(value)) {
+    const model = typeof value.model === "string" ? value.model : typeof value.id === "string" ? value.id : null;
+    if (typeof value.providerID === "string" && model) {
+      return { id: model, providerID: value.providerID, ...(value.variant ? { variant: String(value.variant) } : {}) };
+    }
+    return null;
+  }
+  if (typeof value === "string" && /^[^/#\s]+\/[^#\s]+/.test(value)) {
+    const [rest, variant] = value.split("#");
+    const [providerID, ...modelParts] = rest.split("/");
+    return { id: modelParts.join("/"), providerID, ...(variant ? { variant } : {}) };
+  }
+  return null;
+}
+
+// Deep merge for config documents: objects recurse, everything else
+// (arrays included) is replaced by the patch value.
+function deepMerge(base, patch) {
+  if (!isPlainObject(base) || !isPlainObject(patch)) return patch;
+  const out = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    out[key] = isPlainObject(value) && isPlainObject(out[key]) ? deepMerge(out[key], value) : value;
+  }
+  return out;
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, index) => deepEqual(item, b[index]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every((key) => Object.prototype.hasOwnProperty.call(b, key) && deepEqual(a[key], b[key]));
+}
+
+// GET /api/config returns the discovery chain — ordered documents from the
+// global config down to the location itself. Merging them in order yields
+// the effective config (later documents override earlier ones).
+function mergeConfigChain(entries) {
+  let effective = {};
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (entry?.type === "document" && isPlainObject(entry.info)) effective = deepMerge(effective, entry.info);
+  }
+  return effective;
+}
+
+// Dot-path helpers over plain objects (config keys never contain dots).
+function getPath(object, dotted) {
+  let current = object;
+  for (const part of String(dotted).split(".")) {
+    if (!isPlainObject(current)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function setPath(object, dotted, value) {
+  const parts = String(dotted).split(".");
+  let current = object;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(current[parts[i]])) current[parts[i]] = {};
+    current = current[parts[i]];
+  }
+  current[parts[parts.length - 1]] = value;
+}
+
+function deletePath(object, dotted) {
+  const parts = String(dotted).split(".");
+  let current = object;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(current)) return;
+    current = current[parts[i]];
+  }
+  if (isPlainObject(current)) delete current[parts[parts.length - 1]];
+}
+
+// Subset comparison: only paths the snippet names are considered; extra
+// effective keys are irrelevant. `skills` is excluded here — sources use
+// subset-of-array semantics (see missingSkillSources).
+function diffRootState(desired, effective) {
+  const changes = [];
+  const walk = (want, have, prefix) => {
+    for (const [key, value] of Object.entries(want || {})) {
+      const at = prefix ? `${prefix}.${key}` : key;
+      const current = isPlainObject(have) ? have[key] : undefined;
+      if (isPlainObject(value)) {
+        walk(value, isPlainObject(current) ? current : undefined, at);
+      } else if (current === undefined) {
+        changes.push({ path: at, kind: "add" });
+      } else if (!deepEqual(value, current)) {
+        changes.push({ path: at, kind: "change" });
+      }
+    }
+  };
+  const { skills, ...rest } = desired || {};
+  walk(rest, effective, "");
+  return changes;
+}
+
+// Desired skill sources are satisfied when each is already part of the
+// effective `skills` array — never a full-array equality.
+function missingSkillSources(sources, effective) {
+  const present = Array.isArray(isPlainObject(effective) ? effective.skills : null) ? effective.skills.map(String) : [];
+  return (sources || []).filter((source) => !present.includes(String(source)));
+}
+
+function normalizeInstallCommand(command) {
+  return String(command || "").replace(/\s+/g, " ").trim();
+}
+
+// An install entry is satisfied when its declared skill id is listed for
+// the location, or — with no declared id — when the learned manifest says
+// the exact command produced skills that are all still listed. Unknown
+// commands (first use, or edited since) read as unsatisfied: the check is
+// read-only and must never execute anything.
+function checkSkillInstalls(installs, skillIds, manifest) {
+  const entries = Array.isArray(manifest?.installs) ? manifest.installs : [];
+  return (installs || []).map((entry) => {
+    if (entry.id) return { ...entry, satisfied: skillIds.has(entry.id) };
+    const learned = entries.find(
+      (item) =>
+        typeof item?.command === "string" &&
+        normalizeInstallCommand(item.command) === normalizeInstallCommand(entry.install),
+    );
+    const ids = Array.isArray(learned?.ids) ? learned.ids.map(String) : [];
+    const satisfied = !!learned && ids.length > 0 && ids.every((id) => skillIds.has(id));
+    return { ...entry, satisfied, learnedIds: ids.length ? ids : null };
+  });
+}
+
+// The single config file vibed ever writes: the highest-precedence slot of
+// the session root, plus the vibed-owned learned-install manifest.
+function localOpenCodeConfigPath(directory) {
+  return path.join(directory, ".opencode", "opencode.json");
+}
+
+function skillManifestPath(directory) {
+  return path.join(directory, ".opencode", "vibed.json");
+}
+
+// JSONC or otherwise-unparseable files surface as parseError — the applier
+// refuses to merge into those rather than clobbering them.
+function readLocalOpenCodeConfig(directory) {
+  const file = localOpenCodeConfigPath(directory);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return { config: null, existed: false, parseError: null };
+  }
+  try {
+    const config = JSON.parse(raw);
+    return isPlainObject(config)
+      ? { config, existed: true, parseError: null }
+      : { config: null, existed: true, parseError: "root is not an object" };
+  } catch (error) {
+    return { config: null, existed: true, parseError: error.message };
+  }
+}
+
+function writeLocalOpenCodeConfig(directory, config) {
+  fs.mkdirSync(path.dirname(localOpenCodeConfigPath(directory)), { recursive: true });
+  fs.writeFileSync(localOpenCodeConfigPath(directory), `${JSON.stringify(config, null, 2)}\n`);
+}
+
+function readSkillManifest(directory) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(skillManifestPath(directory), "utf8"));
+    const installs = Array.isArray(parsed?.installs)
+      ? parsed.installs.filter((item) => item && typeof item.command === "string")
+      : [];
+    return { installs };
+  } catch {
+    return { installs: [] };
+  }
+}
+
+function writeSkillManifest(directory, manifest) {
+  fs.mkdirSync(path.dirname(skillManifestPath(directory)), { recursive: true });
+  fs.writeFileSync(skillManifestPath(directory), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1434,27 @@ class OpenCodeClient {
 
   agents(directory) {
     return this.request(`/api/agent${this.locationQuery(directory)}`);
+  }
+
+  // Ordered config discovery chain for a location (global → ancestors →
+  // local, each document parsed) — the diff gate's read side.
+  configChain(directory) {
+    return this.request(`/api/config${this.locationQuery(directory)}`, { timeoutMs: 10000 });
+  }
+
+  skillList(directory) {
+    return this.request(`/api/skill${this.locationQuery(directory)}`, { timeoutMs: 10000 });
+  }
+
+  reloadConfig() {
+    return this.request("/api/location/reload", { method: "POST" });
+  }
+
+  setSessionEnvironment(sessionId, variables) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/environment`, {
+      method: "PUT",
+      body: { variables },
+    });
   }
 
   setSessionAgent(sessionId, agent) {
@@ -3595,13 +3880,23 @@ class SessionsDashboard {
       }
       if (draftsCapable) {
         const newButton = toolbar.createEl("button", { text: "New session" });
-        newButton.addEventListener("click", () =>
+        newButton.addEventListener("click", () => {
+          // Snippet config (spec/007): extracted per click so live edits to
+          // the block apply without remounting the dashboard.
+          let snippet = null;
+          try {
+            snippet = extractSnippetSessionConfig(this.options);
+          } catch (error) {
+            new Notice(error.message);
+            return;
+          }
           this.plugin.newSession({
             dirs: this.options.dirs,
             basedir: this.options.basedir,
             connector: this.requestedConnectorName || undefined,
-          }),
-        );
+            snippet,
+          });
+        });
       }
       if (this.options.showSettings) {
         const settingsButton = toolbar.createEl("button", { text: "Settings" });
@@ -4258,6 +4553,11 @@ class SessionChatView extends ItemView {
     // session is created lazily when the first message is sent.
     this.draftDirectory = plugin.pendingDraftDirectory || null;
     plugin.pendingDraftDirectory = null;
+    // Snippet session config (spec/007): when the draft was started from a
+    // config-carrying vibed block. Ephemeral keys prefill the selectors and
+    // ride on session create; root-state keys gate at first send.
+    this.snippetConfig = plugin.pendingSnippetConfig || null;
+    plugin.pendingSnippetConfig = null;
     this.session = null;
     this.offline = false;
     this.busy = false;
@@ -4346,6 +4646,7 @@ class SessionChatView extends ItemView {
     return {
       sessionId: this.sessionId,
       draftDirectory: this.draftDirectory,
+      snippetConfig: this.snippetConfig || null,
       connectorId: this.connectorId || this.connector?.id || null,
       connectorName: this.connectorName || this.connector?.name || null,
       notesOpen: this.notesOpen,
@@ -4370,6 +4671,9 @@ class SessionChatView extends ItemView {
         }
       } else if (typeof state.draftDirectory === "string" && state.draftDirectory) {
         if (!this.sessionId) this.draftDirectory = state.draftDirectory;
+      }
+      if (!this.sessionId && isPlainObject(state.snippetConfig)) {
+        if (!this.snippetConfig) this.snippetConfig = state.snippetConfig;
       }
     }
     return super.setState ? super.setState(state) : undefined;
@@ -5254,6 +5558,12 @@ class SessionChatView extends ItemView {
       : null;
     if (current) this.selectModelRef(current, null);
     else select.value = defaultOption.value;
+    // Snippet model (spec/007) is the draft default — the user can still
+    // pick another before the first message.
+    if (!current && this.snippetConfig) {
+      const ref = normalizeModelRef(this.snippetConfig.ephemeral.model);
+      if (ref) this.selectModelRef(ref, null);
+    }
     select.style.display = "";
   }
 
@@ -5359,6 +5669,11 @@ class SessionChatView extends ItemView {
     const current = this.session?.agent || "";
     if (current) this.selectAgentId(current);
     else select.value = defaultOption.value;
+    // Snippet agent (spec/007) is the draft default; selectAgentId injects
+    // the option when the location does not list it yet.
+    if (!current && this.snippetConfig?.ephemeral?.agent) {
+      this.selectAgentId(String(this.snippetConfig.ephemeral.agent));
+    }
     select.style.display = "";
   }
 
@@ -6709,17 +7024,35 @@ class SessionChatView extends ItemView {
   // empty sessions pile up when a draft is abandoned.
   async sendDraft(text) {
     try {
+      // Snippet config gate (spec/007): read-only diff of the snippet's
+      // desired state against the live directory; a diff opens the
+      // consent dialogue (install / proceed as-is). Cancel keeps the
+      // message in the composer and writes nothing.
+      if (this.snippetConfig) {
+        const proceed = await runSnippetConfigGate(this.plugin, this.driver.client, this.draftDirectory, this.snippetConfig);
+        if (!proceed) return;
+      }
+      const snippet = this.snippetConfig?.ephemeral || {};
       const created = await this.driver.client.request("/api/session", {
         method: "POST",
         body: {
           location: { directory: this.draftDirectory },
-          model: this.selectedModelRef() || undefined,
-          agent: this.selectedAgentId() || undefined,
+          model: this.selectedModelRef() || normalizeModelRef(snippet.model) || undefined,
+          agent: this.selectedAgentId() || (snippet.agent ? String(snippet.agent) : undefined),
+          permissions: Array.isArray(snippet.permissions) ? snippet.permissions : undefined,
         },
       });
       const session = created?.data;
       if (!session?.id) throw new Error("server returned no session id");
+      if (snippet.environment && isPlainObject(snippet.environment)) {
+        try {
+          await this.driver.client.setSessionEnvironment(session.id, snippet.environment);
+        } catch (error) {
+          new Notice(`Session environment not applied: ${error.message}`);
+        }
+      }
       this.draftDirectory = null;
+      this.snippetConfig = null;
       this.session = session;
       this.bindSession(session.id);
       this.renderHeader();
@@ -6767,8 +7100,10 @@ class NewSessionView extends ItemView {
     this.plugin = plugin;
     this.directories = plugin.pendingPickerDirectories || null;
     this.connectorId = plugin.pendingPickerConnectorId || null;
+    this.snippetConfig = plugin.pendingPickerSnippetConfig || null;
     plugin.pendingPickerDirectories = null;
     plugin.pendingPickerConnectorId = null;
+    plugin.pendingPickerSnippetConfig = null;
   }
 
   getViewType() {
@@ -6783,9 +7118,10 @@ class NewSessionView extends ItemView {
     return "plus";
   }
 
-  setDirectories(directories, connectorId = null) {
+  setDirectories(directories, connectorId = null, snippetConfig = null) {
     this.directories = directories;
     this.connectorId = connectorId;
+    this.snippetConfig = snippetConfig;
     if (this.contentEl) this.render();
   }
 
@@ -6808,7 +7144,7 @@ class NewSessionView extends ItemView {
     const cards = contentEl.createDiv({ cls: "opencode-sessions-cards" });
     for (const directory of this.directories) {
       const card = cards.createDiv({ cls: "opencode-sessions-card" });
-      card.addEventListener("click", () => this.plugin.openSessionDraft(directory, this.connectorId));
+      card.addEventListener("click", () => this.plugin.openSessionDraft(directory, this.connectorId, this.snippetConfig));
       const head = card.createDiv({ cls: "opencode-sessions-card-head" });
       const titleWrap = head.createSpan({ cls: "oc-picker-title" });
       setIcon(titleWrap.createSpan({ cls: "oc-picker-icon" }), "folder");
@@ -6841,6 +7177,386 @@ class NewSessionView extends ItemView {
       });
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Snippet config dialogue + install. The gate is read-only up to the
+// moment the user clicks Install; from there vibed owns exactly two files
+// in the session root (.opencode/opencode.json merge, .opencode/vibed.json
+// manifest) and runs the snippet's skill-installer commands. Existing
+// config values are never rendered — GET /api/config responses can carry
+// credentials, so the diff shows paths, kinds, and the snippet's own
+// declared values only.
+// ---------------------------------------------------------------------------
+
+// Runs one skill installer in the session root, streaming output lines to
+// onLine. Installer strings are shell commands by design (npx skills add
+// owner/repo, …). The child is detached: closing the dialogue never kills
+// a half-run installer — the next session start re-checks the result.
+function runInstallCommand(command, directory, onLine) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, { shell: true, cwd: directory, detached: true });
+    } catch (error) {
+      onLine(`spawn failed: ${error.message}`);
+      resolve(-1);
+      return;
+    }
+    try {
+      child.unref();
+    } catch {
+      // already reaped — output listeners below still fire what they can
+    }
+    const emit = (chunk) => {
+      for (const line of String(chunk).split(/\r?\n/)) {
+        const text = line.trimEnd();
+        if (text) onLine(text);
+      }
+    };
+    child.stdout?.on("data", emit);
+    child.stderr?.on("data", emit);
+    child.on("error", (error) => {
+      onLine(`spawn failed: ${error.message}`);
+      resolve(-1);
+    });
+    child.on("close", (code) => resolve(code ?? -1));
+  });
+}
+
+// All leaf dot-paths of a desired root state (skills excluded — sources
+// use union semantics). This is the full desired set, NOT the unsatisfied
+// subset: retraction decisions must compare against everything the
+// snippet still wants.
+function rootStateLeafPaths(rootState) {
+  const paths = [];
+  const walk = (want, prefix) => {
+    for (const [key, value] of Object.entries(want || {})) {
+      const at = prefix ? `${prefix}.${key}` : key;
+      if (isPlainObject(value)) walk(value, at);
+      else paths.push(at);
+    }
+  };
+  const { skills, ...rest } = rootState || {};
+  walk(rest, "");
+  return paths;
+}
+
+// Merges the snippet's unsatisfied root-state paths into <root>/.opencode/
+// opencode.json — the highest-precedence slot, so the write wins without
+// touching any other discovered file. The x-vibed marker records the
+// dot-paths vibed placed; paths the snippet later drops are retracted only
+// when the marker owns them. User-authored keys are never deleted. The
+// skills array merges as a union so the local file cannot shadow sources
+// provided by an ancestor config.
+function applyRootStateToConfig(directory, rootState, changes, missingSources, effective) {
+  const local = readLocalOpenCodeConfig(directory);
+  if (local.existed && local.parseError) {
+    throw new Error(
+      `cannot merge into ${localOpenCodeConfigPath(directory)} — ${local.parseError} (JSONC files must be merged manually)`,
+    );
+  }
+  const config = local.config || {};
+  const previousMarker = isPlainObject(config[VIBED_MARKER_KEY]) ? config[VIBED_MARKER_KEY] : {};
+  const previousPaths = Array.isArray(previousMarker.keys) ? previousMarker.keys.map(String) : [];
+  // The full desired set governs retraction and the marker; `changes`
+  // (the unsatisfied subset) only builds the overlay. Recording a path
+  // the snippet wants but an ancestor already satisfies would be wrong —
+  // hence the present-in-file filter on the marker below.
+  const desiredPaths = rootStateLeafPaths(rootState);
+
+  const overlay = {};
+  for (const change of changes) setPath(overlay, change.path, getPath(rootState, change.path));
+  if (missingSources.length) {
+    const existing = Array.isArray(config.skills)
+      ? config.skills.map(String)
+      : Array.isArray(isPlainObject(effective) ? effective.skills : null)
+        ? effective.skills.map(String)
+        : [];
+    overlay.skills = [...new Set([...existing, ...missingSources.map(String)])];
+  }
+
+  let next = deepMerge(config, overlay);
+  const retracted = [];
+  for (const previous of previousPaths) {
+    if (desiredPaths.includes(previous)) continue;
+    deletePath(next, previous); // marker-owned path the snippet retracted
+    retracted.push(previous);
+  }
+  // A retract can leave empty object husks ("mcp.servers.x.url" retracts
+  // → "mcp.servers.x" → maybe "mcp.servers"). Drop those, and only those,
+  // bottom-up so unrelated user keys are untouched.
+  for (const dotted of retracted) {
+    const parts = dotted.split(".");
+    for (let leafIndex = parts.length - 1; leafIndex >= 1; leafIndex -= 1) {
+      const container = getPath(next, parts.slice(0, leafIndex).join("."));
+      if (!isPlainObject(container) || Object.keys(container).length) break;
+      if (leafIndex === 1) {
+        delete next[parts[0]];
+      } else {
+        const parent = getPath(next, parts.slice(0, leafIndex - 1).join("."));
+        if (!isPlainObject(parent)) break;
+        delete parent[parts[leafIndex - 1]];
+      }
+    }
+  }
+  next[VIBED_MARKER_KEY] = {
+    managed: true,
+    keys: desiredPaths.filter((dotted) => getPath(next, dotted) !== undefined),
+  };
+  writeLocalOpenCodeConfig(directory, next);
+}
+
+function clientIsLocal(client) {
+  try {
+    const url = new URL(client.endpoint?.baseUrl || "");
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Truncates a snippet-declared value for the diff view. Only snippet
+// values ever pass through here — live config values stay unread.
+function previewSnippetValue(value) {
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  if (text === undefined) text = "…";
+  return text.length > 160 ? `${text.slice(0, 157)}…` : text;
+}
+
+class SnippetConfigModal extends Modal {
+  constructor(app, client, snippet, details, done) {
+    super(app);
+    this.client = client;
+    this.snippet = snippet;
+    this.details = details;
+    this.done = done;
+    this.settled = false;
+    this.logEl = null;
+  }
+
+  finish(choice) {
+    if (this.settled) return;
+    this.settled = true;
+    this.close();
+    this.done(choice);
+  }
+
+  onClose() {
+    // ESC / backdrop during the choice phase means abort; after install it
+    // means "start as-is" — either way the promise must not dangle.
+    this.finish(this.installed ? "install" : "cancel");
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("oc-configdiff");
+    this.titleEl.setText("Session config differs");
+
+    const header = contentEl.createDiv({ cls: "oc-configdiff-sub" });
+    header.createSpan({ text: "The snippet wants config that " });
+    header.createEl("code", { text: displayDirectory(this.details.directory, null) });
+    header.createSpan({ text: " does not provide yet. Install writes .opencode/opencode.json in that directory." });
+
+    this.renderDiff(contentEl);
+    this.renderInstalls(contentEl);
+    this.logEl = contentEl.createDiv({ cls: "oc-configdiff-log", attr: { style: "display:none" } });
+    this.renderButtons(contentEl);
+  }
+
+  renderDiff(container) {
+    const changes = this.details.changes;
+    const missingSources = this.details.missingSources;
+    const rootState = this.snippet.rootState;
+    if (!changes.length && !missingSources.length) return;
+    const section = container.createDiv({ cls: "oc-configdiff-group" });
+    section.createDiv({ cls: "oc-configdiff-title", text: "Config changes" });
+    for (const change of changes) {
+      this.renderRow(section, change.kind, change.path, getPath(rootState, change.path));
+    }
+    for (const source of missingSources) {
+      this.renderRow(section, "add", `skills: ${source}`, null);
+    }
+  }
+
+  renderInstalls(container) {
+    if (!this.details.installs.length) return;
+    const section = container.createDiv({ cls: "oc-configdiff-group" });
+    section.createDiv({ cls: "oc-configdiff-title", text: "Skills to install" });
+    for (const entry of this.details.installs) {
+      const row = section.createDiv({ cls: "oc-configdiff-row" });
+      row.createSpan({ cls: "oc-configdiff-kind oc-configdiff-kind-add", text: "install" });
+      row.createSpan({ cls: "oc-configdiff-path", text: entry.id || "new skill" });
+      row.createSpan({ cls: "oc-configdiff-value", text: entry.install });
+    }
+    section.createDiv({
+      cls: "oc-configdiff-note",
+      text: "Install commands run in the session directory via your shell. Their output streams below while installing.",
+    });
+  }
+
+  renderRow(section, kind, path, value) {
+    const row = section.createDiv({ cls: "oc-configdiff-row" });
+    row.createSpan({ cls: `oc-configdiff-kind oc-configdiff-kind-${kind}`, text: kind });
+    row.createSpan({ cls: "oc-configdiff-path", text: path });
+    if (value !== null && value !== undefined) {
+      row.createSpan({ cls: "oc-configdiff-value", text: previewSnippetValue(value) });
+    }
+  }
+
+  renderButtons(container) {
+    this.buttonsEl = container.createDiv({ cls: "oc-configdiff-buttons" });
+    if (this.installed) {
+      this.renderPostInstallButtons();
+      return;
+    }
+    const local = clientIsLocal(this.client);
+    const install = this.buttonsEl.createEl("button", {
+      text: local ? "Install & start" : "Install needs a local server",
+      cls: "mod-cta",
+    });
+    install.disabled = !local;
+    if (!local) {
+      install.title = "This connector talks to a remote OpenCode server — vibed cannot write its filesystem.";
+    }
+    install.addEventListener("click", () => this.runInstall());
+    const asIs = this.buttonsEl.createEl("button", { text: "Proceed as-is" });
+    asIs.addEventListener("click", () => this.finish("as-is"));
+  }
+
+  renderPostInstallButtons() {
+    this.buttonsEl.empty();
+    const start = this.buttonsEl.createEl("button", { text: "Start session", cls: "mod-cta" });
+    start.addEventListener("click", () => this.finish("install"));
+    const cancel = this.buttonsEl.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => this.finish("cancel"));
+  }
+
+  log(text) {
+    if (!this.logEl) return;
+    if (this.logEl.style.display === "none") this.logEl.style.display = "";
+    this.logEl.appendText(`${text}\n`);
+    this.logEl.scrollTop = this.logEl.scrollHeight;
+  }
+
+  async runInstall() {
+    for (const button of this.buttonsEl.querySelectorAll("button")) button.disabled = true;
+    const { directory } = this.details;
+    const problems = [];
+
+    if (this.details.changes.length || this.details.missingSources.length) {
+      try {
+        applyRootStateToConfig(directory, this.snippet.rootState, this.details.changes, this.details.missingSources, this.details.effective);
+        this.log("config merged into .opencode/opencode.json");
+      } catch (error) {
+        problems.push(error.message);
+        this.log(`config: ${error.message}`);
+      }
+    }
+
+    const manifest = readSkillManifest(directory);
+    for (const entry of this.details.installs) {
+      this.log(`$ ${entry.install}`);
+      const code = await runInstallCommand(entry.install, directory, (line) => this.log(line));
+      let learnedIds = [];
+      try {
+        const response = await this.client.skillList(directory);
+        const ids = new Set((Array.isArray(response?.data) ? response.data : []).map((skill) => skill?.id).filter(Boolean));
+        learnedIds = [...ids].filter((id) => !this.details.skillIds.has(id));
+        if (entry.id && ids.has(entry.id)) learnedIds = [...new Set([...learnedIds, entry.id])];
+        this.details.skillIds = ids; // later commands diff against the updated list
+      } catch (error) {
+        this.log(`could not re-check skills: ${error.message}`);
+      }
+      const key = normalizeInstallCommand(entry.install);
+      manifest.installs = manifest.installs.filter(
+        (item) => normalizeInstallCommand(item.command) !== key,
+      );
+      manifest.installs.push({ command: entry.install, ids: learnedIds });
+      writeSkillManifest(directory, manifest);
+      if (code !== 0) problems.push(`"${entry.install}" exited with code ${code}`);
+      this.log(`exit ${code}${learnedIds.length ? ` — new skills: ${learnedIds.join(", ")}` : ""}`);
+    }
+
+    try {
+      await this.client.reloadConfig();
+      this.log("server config reloaded");
+    } catch (error) {
+      this.log(`reload failed: ${error.message}`);
+    }
+
+    // Verify: re-run the read-only diff. Whatever remains is reported, not
+    // hidden — a no-op installer shows up here as "still missing".
+    let remaining = null;
+    try {
+      const [chain, skills] = await Promise.all([
+        this.client.configChain(directory),
+        this.client.skillList(directory),
+      ]);
+      const effective = mergeConfigChain(chain);
+      const changes = diffRootState(this.snippet.rootState, effective);
+      const missingSources = missingSkillSources(this.snippet.rootState.skills, effective);
+      const ids = new Set((Array.isArray(skills?.data) ? skills.data : []).map((skill) => skill?.id).filter(Boolean));
+      const pending = checkSkillInstalls(this.snippet.installs, ids, readSkillManifest(directory)).filter(
+        (entry) => !entry.satisfied,
+      );
+      remaining = { changes, missingSources, pending };
+    } catch (error) {
+      this.log(`verify failed: ${error.message}`);
+    }
+
+    this.installed = true;
+    const summary = this.logEl.createDiv({ cls: "oc-configdiff-summary" });
+    if (problems.length) {
+      summary.addClass("oc-configdiff-problems");
+      summary.setText(`Finished with problems — the session will start with whatever is in place. ${problems.join("; ")}`);
+    } else if (remaining && (remaining.changes.length || remaining.missingSources.length || remaining.pending.length)) {
+      summary.setText("Applied, but some items are still not satisfied — the session starts with the current state.");
+    } else {
+      summary.setText("Applied — config now matches the snippet.");
+    }
+    this.renderPostInstallButtons();
+  }
+}
+
+// Session-start gate. Read-only until the user consents: fetches the
+// location's config chain and skill list, diffs the snippet against them,
+// and opens the dialogue only when something is actually missing. Resolves
+// true unless the user cancels; server-unreachable degrades to as-is (the
+// session create surfaces the real error).
+async function runSnippetConfigGate(plugin, client, directory, snippet) {
+  if (!snippet) return true;
+  let chain = [];
+  let skills = { data: [] };
+  try {
+    const [chainResponse, skillsResponse] = await Promise.all([
+      client.configChain(directory),
+      client.skillList(directory),
+    ]);
+    chain = Array.isArray(chainResponse) ? chainResponse : [];
+    skills = skillsResponse && Array.isArray(skillsResponse.data) ? skillsResponse : { data: [] };
+  } catch (error) {
+    new Notice(`Snippet config check skipped — server unreachable (${error.message})`);
+    return true;
+  }
+  const effective = mergeConfigChain(chain);
+  const skillIds = new Set((skills.data || []).map((skill) => skill?.id).filter(Boolean));
+  const manifest = readSkillManifest(directory);
+  const changes = diffRootState(snippet.rootState, effective);
+  const missingSources = missingSkillSources(snippet.rootState.skills, effective);
+  const pendingInstalls = checkSkillInstalls(snippet.installs, skillIds, manifest).filter((entry) => !entry.satisfied);
+  if (!changes.length && !missingSources.length && !pendingInstalls.length) return true;
+
+  const details = { directory, changes, missingSources, installs: pendingInstalls, effective, skillIds };
+  return new Promise((resolve) => {
+    new SnippetConfigModal(plugin.app, client, snippet, details, (choice) => resolve(choice !== "cancel")).open();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -7337,7 +8053,9 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.listRefreshTimer = null;
     this.pendingSessionRef = null;
     this.pendingDraftDirectory = null;
+    this.pendingSnippetConfig = null;
     this.pendingPickerDirectories = null;
+    this.pendingPickerSnippetConfig = null;
 
     this.registry = new ConnectorRegistry(this);
     this.registry.init();
@@ -7882,34 +8600,37 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       new Notice("No directories configured — add them in OpenCode Sessions settings.");
       return;
     }
+    const snippet = options.snippet || null;
     if (directories.length === 1) {
-      await this.openSessionDraft(directories[0], entry.connector.id);
+      await this.openSessionDraft(directories[0], entry.connector.id, snippet);
       return;
     }
-    await this.activateNewSessionPicker(directories, entry.connector.id);
+    await this.activateNewSessionPicker(directories, entry.connector.id, snippet);
   }
 
-  async openSessionDraft(directory, connectorId = null) {
+  async openSessionDraft(directory, connectorId = null, snippetConfig = null) {
     const resolvedConnectorId = connectorId || this.registry.defaultConnector()?.connector.id || null;
     this.pendingDraftDirectory = directory;
+    this.pendingSnippetConfig = snippetConfig;
     this.pendingSessionRef = { connectorId: resolvedConnectorId, sessionId: null };
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: VIEW_TYPE_SESSION,
       active: true,
-      state: { draftDirectory: directory, connectorId: resolvedConnectorId },
+      state: { draftDirectory: directory, connectorId: resolvedConnectorId, snippetConfig },
     });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
   }
 
-  async activateNewSessionPicker(directories, connectorId = null) {
+  async activateNewSessionPicker(directories, connectorId = null, snippetConfig = null) {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_NEW_SESSION)[0];
     if (leaf && leaf.view instanceof NewSessionView) {
-      leaf.view.setDirectories(directories, connectorId);
+      leaf.view.setDirectories(directories, connectorId, snippetConfig);
     } else {
       this.pendingPickerDirectories = directories;
       this.pendingPickerConnectorId = connectorId;
+      this.pendingPickerSnippetConfig = snippetConfig;
       leaf = this.app.workspace.getLeaf("tab");
       await leaf.setViewState({ type: VIEW_TYPE_NEW_SESSION, active: true });
     }

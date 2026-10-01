@@ -17,11 +17,23 @@ src = src.replace(
   obsidianLine,
   `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
-const { SessionsDashboard, SessionNotes } = require(tmp);
+const {
+  SessionsDashboard,
+  SessionNotes,
+  parseBlockConfig,
+  extractSnippetSessionConfig,
+  normalizeModelRef,
+  deepMerge,
+  deepEqual,
+  mergeConfigChain,
+  diffRootState,
+  missingSkillSources,
+  checkSkillInstalls,
+} = require(tmp);
 
 function makeEl(tag, opts = {}) {
   const el = {
@@ -200,6 +212,116 @@ const check = (name, fn) => {
     if (!texts2.some((t) => /1 of 2 subagents running/.test(t))) throw new Error("subs summary missing after expand");
     // Orphan child still rendered as its own card.
     if (!texts2.includes("Orphan")) throw new Error("orphan subsession dropped");
+  });
+
+  check("parseBlockConfig parses inline JSON values and list items", () => {
+    const config = parseBlockConfig(
+      [
+        "connector: opencode",
+        'mcp: {"kangram": {"type": "remote", "url": "https://k.example"}}',
+        "skills:",
+        "  - ./skills/analysis",
+        '  - {"install": "npx skills add owner/repo"}',
+      ].join("\n"),
+    );
+    if (config.connector !== "opencode") throw new Error("plain key lost");
+    if (config.mcp?.kangram?.type !== "remote") throw new Error("inline JSON value not parsed");
+    if (config.skills[0] !== "./skills/analysis") throw new Error("string list item lost");
+    if (config.skills[1]?.install !== "npx skills add owner/repo") throw new Error("JSON list item not parsed");
+  });
+
+  check("extractSnippetSessionConfig splits ephemeral/root/installs", () => {
+    const snippet = extractSnippetSessionConfig({
+      connector: "opencode",
+      model: "zai/glm-5.3#fast",
+      permissions: [{ action: "edit", resource: "*", effect: "allow" }],
+      environment: { API_SCOPE: "research" },
+      mcp: { kangram: { type: "remote", url: "https://k.example" } },
+      skills: [
+        "./skills/analysis",
+        { install: "npx skills add owner/repo" },
+        { id: "deep-research", install: "npx skills add zema/skill" },
+      ],
+    });
+    if (!snippet) throw new Error("snippet not detected");
+    if (snippet.ephemeral.model !== "zai/glm-5.3#fast") throw new Error("ephemeral model lost");
+    if (!Array.isArray(snippet.ephemeral.permissions)) throw new Error("permissions lost");
+    if (snippet.rootState.mcp?.kangram?.type !== "remote") throw new Error("root mcp lost");
+    if (snippet.rootState.skills.join(",") !== "./skills/analysis") throw new Error("skills sources wrong");
+    if (snippet.installs.length !== 2) throw new Error("installs wrong");
+    if (snippet.installs[1].id !== "deep-research") throw new Error("declared id lost");
+    if (extractSnippetSessionConfig({ connector: "x", dirs: ["a"] }) !== null) {
+      throw new Error("no-config block should yield null");
+    }
+    let threw = false;
+    try {
+      extractSnippetSessionConfig({ skills: [{ nope: true }] });
+    } catch {
+      threw = true;
+    }
+    if (!threw) throw new Error("malformed skill entry should throw");
+  });
+
+  check("mergeConfigChain honors precedence; diffRootState is subset-only", () => {
+    const chain = [
+      { type: "document", path: "/global.json", info: { mcp: { servers: { a: { url: "1" }, b: { url: "2" } } } } },
+      { type: "directory", path: "/home" },
+      { type: "document", path: "/proj/.opencode/opencode.json", info: { mcp: { servers: { b: { url: "3" } } } } },
+    ];
+    const effective = mergeConfigChain(chain);
+    if (effective.mcp.servers.a.url !== "1") throw new Error("ancestor lost");
+    if (effective.mcp.servers.b.url !== "3") throw new Error("local did not override");
+    const desired = { mcp: { servers: { b: { url: "3" }, kangram: { url: "4" } } } };
+    const changes = diffRootState(desired, effective);
+    if (changes.length !== 1 || changes[0].path !== "mcp.servers.kangram.url" || changes[0].kind !== "add") {
+      throw new Error(`unexpected diff: ${JSON.stringify(changes)}`);
+    }
+    if (diffRootState({ mcp: { servers: { b: { url: "3" } } } }, effective).length) {
+      throw new Error("satisfied subset should not diff");
+    }
+    const changed = diffRootState({ mcp: { servers: { b: { url: "9" } } } }, effective);
+    if (changed.length !== 1 || changed[0].kind !== "change") throw new Error("value change not detected");
+  });
+
+  check("missingSkillSources is subset-of-array", () => {
+    const effective = { skills: ["./a", "./b"] };
+    if (missingSkillSources(["./b"], effective).length) throw new Error("present source flagged");
+    const missing = missingSkillSources(["./b", "./c"], effective);
+    if (missing.join(",") !== "./c") throw new Error(`unexpected missing: ${missing}`);
+    if (missingSkillSources(["./c"], {}).length !== 1) throw new Error("no-skills config must miss everything");
+  });
+
+  check("checkSkillInstalls: declared id, learned manifest, unknown", () => {
+    const result = checkSkillInstalls(
+      [
+        { id: "deep-research", install: "npx skills add zema/skill" },
+        { id: null, install: "npx skills add owner/repo" }, // whitespace differs from manifest — must still match
+        { id: null, install: "npx skills add unknown/pkg" },
+      ],
+      new Set(["deep-research", "other"]),
+      { installs: [{ command: "npx   skills add owner/repo", ids: ["other"] }] },
+    );
+    if (!result[0].satisfied) throw new Error("declared id should satisfy");
+    if (!result[1].satisfied) throw new Error("learned manifest should satisfy");
+    if (result[2].satisfied) throw new Error("unknown command must stay a diff");
+  });
+
+  check("normalizeModelRef parses string and object refs", () => {
+    const ref = normalizeModelRef("zai/glm-5.3#fast");
+    if (!ref || ref.providerID !== "zai" || ref.id !== "glm-5.3" || ref.variant !== "fast") {
+      throw new Error(`string ref: ${JSON.stringify(ref)}`);
+    }
+    const obj = normalizeModelRef({ providerID: "zai", model: "glm-5.3" });
+    if (!obj || obj.id !== "glm-5.3") throw new Error("object ref");
+    if (normalizeModelRef("not-a-ref") !== null) throw new Error("garbage should be null");
+  });
+
+  check("deepMerge replaces arrays and recurses objects", () => {
+    const merged = deepMerge({ a: { x: 1, y: 2 }, list: [1, 2] }, { a: { y: 9 }, list: [3] });
+    if (merged.a.x !== 1 || merged.a.y !== 9) throw new Error("object merge wrong");
+    if (merged.list.length !== 1 || merged.list[0] !== 3) throw new Error("arrays must replace");
+    if (!deepEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })) throw new Error("equal rejected");
+    if (deepEqual({ a: 1 }, { a: 2 })) throw new Error("unequal accepted");
   });
 
   fs.unlinkSync(tmp);
