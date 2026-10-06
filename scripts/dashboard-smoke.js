@@ -17,7 +17,7 @@ src = src.replace(
   obsidianLine,
   `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
@@ -33,6 +33,10 @@ const {
   diffRootState,
   missingSkillSources,
   checkSkillInstalls,
+  expandHomePath,
+  splitDirGlobs,
+  directoryInSubtree,
+  directoryMatchesFilter,
 } = require(tmp);
 
 function makeEl(tag, opts = {}) {
@@ -314,6 +318,83 @@ const check = (name, fn) => {
     const obj = normalizeModelRef({ providerID: "zai", model: "glm-5.3" });
     if (!obj || obj.id !== "glm-5.3") throw new Error("object ref");
     if (normalizeModelRef("not-a-ref") !== null) throw new Error("garbage should be null");
+  });
+
+  check("expandHomePath expands ~ and ~/, leaves the rest", () => {
+    const home = require("os").homedir();
+    if (expandHomePath("~") !== home) throw new Error("bare ~ not expanded");
+    if (expandHomePath("~/spaces") !== path.join(home, "spaces")) throw new Error("~/… not expanded");
+    if (expandHomePath("/abs/path") !== "/abs/path") throw new Error("absolute touched");
+    if (expandHomePath("~other") !== "~other") throw new Error("foreign tilde touched");
+  });
+
+  check("splitDirGlobs separates exact entries from /* subtrees", () => {
+    const { exact, subtree } = splitDirGlobs(["/a/b", "/a/c/*", "/*", "", "/a/d/*/"]);
+    if (!exact.has("/a/b")) throw new Error("exact entry lost");
+    if (!subtree.has("/a/c")) throw new Error("subtree base wrong");
+    if (!subtree.has("")) throw new Error("root glob should degrade to ''");
+    if (exact.has("/a/d/*") || subtree.has("/a/d")) throw new Error("trailing-slash glob mishandled");
+  });
+
+  check("directoryInSubtree is boundary-safe", () => {
+    if (!directoryInSubtree("/a/b", "/a")) throw new Error("child rejected");
+    if (!directoryInSubtree("/a", "/a")) throw new Error("self rejected");
+    if (directoryInSubtree("/a-b", "/a")) throw new Error("sibling accepted");
+  });
+
+  check("directoryMatchesFilter honors subtrees (path + encoded slug)", () => {
+    const empty = new Set();
+    if (!directoryMatchesFilter({ directory: "/a/b/c" }, empty, empty, new Set(["/a"]))) {
+      throw new Error("real-cwd subtree rejected");
+    }
+    if (directoryMatchesFilter({ directory: "/x/b" }, empty, empty, new Set(["/a"]))) {
+      throw new Error("outside subtree accepted");
+    }
+    if (!directoryMatchesFilter({ encodedDir: "-Users-roman-spaces-kangram" }, empty, empty, new Set(["/Users/roman/spaces"]))) {
+      throw new Error("encoded subtree rejected");
+    }
+    if (directoryMatchesFilter({ encodedDir: "-Users-roman-spaces-other" }, new Set(["/nope"]), new Set(["nope"]), new Set(["/unrelated"]))) {
+      throw new Error("encoded non-match accepted");
+    }
+    if (!directoryMatchesFilter({ directory: "/any" }, empty, empty, empty)) {
+      throw new Error("empty filter must list everything");
+    }
+  });
+
+  check("dashboards surface ~ errors and /* warnings for API-only connectors", () => {
+    const remoteDriver = Object.assign({}, driver, {
+      directoryCapabilities: () => ({ home: false, subtree: false }),
+    });
+    const remoteEntry = { connector: Object.assign({}, connector), driver: remoteDriver };
+    const remotePlugin = {
+      ...plugin,
+      registry: {
+        byName: () => remoteEntry,
+        defaultConnector: () => remoteEntry,
+      },
+    };
+    const collect = (options) => {
+      const dash = new SessionsDashboard(remotePlugin, makeEl("div"), options);
+      dash.refreshConnectorBinding(); // load() does this before computing notices
+      return dash.computeNotices();
+    };
+    const homeNotices = collect({ dirs: ["~/*"] });
+    if (!homeNotices.errors.length || !/Can't resolve/.test(homeNotices.errors[0])) {
+      throw new Error(`~ entry must error: ${JSON.stringify(homeNotices)}`);
+    }
+    if (homeNotices.warnings.length) throw new Error("~ error should take precedence over glob warning");
+    const globNotices = collect({ dirs: ["/srv/*"] });
+    if (globNotices.errors.length) throw new Error("absolute glob must not error");
+    if (!globNotices.warnings.length || !/Subtree dirs/.test(globNotices.warnings[0])) {
+      throw new Error(`subtree entry must warn: ${JSON.stringify(globNotices)}`);
+    }
+    // Local-capable drivers raise no notices for the same entries.
+    const dash = new SessionsDashboard(plugin, makeEl("div"), { dirs: ["/x/*", "~"] });
+    dash.connectorEntry = plugin.registry.defaultConnector();
+    const localNotices = dash.computeNotices();
+    if (localNotices.errors.length || localNotices.warnings.length) {
+      throw new Error(`local connector should be quiet: ${JSON.stringify(localNotices)}`);
+    }
   });
 
   check("deepMerge replaces arrays and recurses objects", () => {

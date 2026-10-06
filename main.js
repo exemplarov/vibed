@@ -448,6 +448,40 @@ function slugifyPath(directory) {
   return String(directory || "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+// `~` / `~/…` → the local home directory. Only meaningful where the local
+// filesystem is authoritative (database + transcript listings); API-only
+// listings of remote servers must NOT expand — the remote home is
+// unknowable from here, so those entries stay literal and the dashboard
+// surfaces an error instead.
+function expandHomePath(directory) {
+  const value = String(directory || "");
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+// Directory entries by matching style: a plain entry matches exactly
+// (session cwd === entry); an entry ending in "/*" matches the subtree —
+// the entry's own directory plus everything beneath it. A bare "/*" (root
+// glob) degrades to "" and matches every absolute path.
+function splitDirGlobs(directories) {
+  const exact = new Set();
+  const subtree = new Set();
+  for (const entry of directories) {
+    const value = path.normalize(String(entry || ""));
+    if (!value) continue;
+    if (value.endsWith("/*")) subtree.add(value.slice(0, -2));
+    else exact.add(value);
+  }
+  return { exact, subtree };
+}
+
+// Boundary-safe subtree membership: the base itself or a path segment
+// beneath it ("/a/b" is inside "/a", "/a-b" is not).
+function directoryInSubtree(directory, base) {
+  return directory === base || directory.startsWith(`${base}/`);
+}
+
 // ---------------------------------------------------------------------------
 // Session-note helpers. Notes are ordinary vault markdown files attached to
 // a session via a `session:` frontmatter key — never via the filename — so
@@ -509,11 +543,27 @@ function decodeEncodedDir(encoded, configuredDirs = []) {
 
 // Encoded dirs (Claude/Cursor) match filter entries by slug — the encoded
 // form is lossless, unlike decoded paths where "forty-two" naively decodes
-// to "forty/two". Real-cwd backends (Codex) match by path.
-function directoryMatchesFilter(entry, wantedPaths, wantedSlugs) {
-  if (!wantedPaths.size) return true;
-  if (entry.encodedDir) return wantedSlugs.has(trimSlugEdges(entry.encodedDir));
-  return wantedPaths.has(path.normalize(entry.directory || ""));
+// to "forty/two". Real-cwd backends (Codex) match by path. Subtree bases
+// match by boundary prefix (slug prefix for encoded dirs — slugs cannot
+// express path boundaries, so "spaces/*" also slugs onto "spaces-other";
+// the approximation is documented, encoded names are lossy by nature).
+function directoryMatchesFilter(entry, wantedPaths, wantedSlugs, wantedSubtrees = new Set()) {
+  if (!wantedPaths.size && !wantedSubtrees.size) return true;
+  if (entry.encodedDir) {
+    const slug = trimSlugEdges(entry.encodedDir);
+    if (wantedSlugs.has(slug)) return true;
+    for (const base of wantedSubtrees) {
+      const baseSlug = slugifyPath(base);
+      if (slug === baseSlug || slug.startsWith(`${baseSlug}-`)) return true;
+    }
+    return false;
+  }
+  const directory = path.normalize(entry.directory || "");
+  if (wantedPaths.has(directory)) return true;
+  for (const base of wantedSubtrees) {
+    if (directoryInSubtree(directory, base)) return true;
+  }
+  return false;
 }
 
 // Best display directory: the exact configured path whose slug matches the
@@ -1740,6 +1790,14 @@ class ConnectorDriver {
     throw new Error(`${this.constructor.name} must implement capabilities()`);
   }
 
+  // Directory-resolution capabilities for dashboards and the new-session
+  // flow. Local-access backends (transcript files, local databases) expand
+  // `~` and honor subtree (`/*`) entries; OpenCode2Driver narrows both for
+  // API-only listings of remote servers.
+  directoryCapabilities() {
+    return { home: true, subtree: true };
+  }
+
   async health() {
     return { ok: false, detail: "unknown connector kind" };
   }
@@ -1909,16 +1967,32 @@ class OpenCode2Driver extends ConnectorDriver {
     return !!this.config.useDatabase && fs.existsSync(this.config.databasePath);
   }
 
+  // Directory-resolution capabilities, consulted by dashboards and the
+  // new-session flow. Direct local access (database listing) can expand
+  // `~` against the local home and honor subtree (`/*`) entries; an
+  // API-only listing (remote connector, or the database moved away) can
+  // do neither — the remote server's home and tree are unknowable.
+  directoryCapabilities() {
+    const usable = this.databaseUsable();
+    return { home: usable, subtree: usable };
+  }
+
   async listSessions(options = {}) {
     if (this.databaseUsable()) return this.listSessionsFromDb(options);
     return this.listSessionsFromApi(options);
   }
 
   async listSessionsFromApi(options = {}) {
-    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
+    // No local filesystem context here: `~` stays literal (it can never
+    // match — the remote home differs) and subtree globs are not applied
+    // (the API exposes no tree guarantee). The dashboard surfaces both
+    // as notices; entries must be absolute + exact for remote connectors.
+    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector, {
+      expandHome: false,
+    });
     const response = await this.client.listSessions();
     const list = Array.isArray(response?.data) ? response.data : [];
-    const wanted = new Set(directories.map((directory) => path.normalize(directory)));
+    const { exact: wanted } = splitDirGlobs(directories);
     const rows = list
       .filter((session) => {
         // Explicit id lookups bypass the directory filter entirely.
@@ -1972,7 +2046,21 @@ class OpenCode2Driver extends ConnectorDriver {
     const table = "session_v2";
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
     if (!directories.length) return [];
-    const directoryList = directories.map(quoteSql).join(", ");
+    // Exact entries → IN list; "/*" entries → the directory itself plus
+    // everything beneath it. Subtrees compare via substr, not LIKE: paths
+    // contain "_" and "%" which LIKE would treat as wildcards.
+    const { exact, subtree } = splitDirGlobs(directories);
+    const clauses = [];
+    if (exact.size) {
+      const directoryList = [...exact].map(quoteSql).join(", ");
+      clauses.push(`${table}.directory IN (${directoryList})`);
+    }
+    for (const base of subtree) {
+      const prefix = `${base}/`;
+      clauses.push(
+        `(${table}.directory = ${quoteSql(base)} OR substr(${table}.directory, 1, ${prefix.length}) = ${quoteSql(prefix)})`,
+      );
+    }
     const tableExists = await runSqlite(
       settings.sqlitePath,
       settings.databasePath,
@@ -2014,7 +2102,6 @@ class OpenCode2Driver extends ConnectorDriver {
       + " LEFT JOIN session_message lm ON lm.session_id = session_v2.id"
       + " AND lm.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id)";
 
-    const clauses = [`directory IN (${directoryList})`];
     if (customSql) clauses.push(`(${customSql})`);
     const rows = (await runSqlite(
       settings.sqlitePath,
@@ -2232,13 +2319,14 @@ class FileConnectorDriver extends ConnectorDriver {
 
   async listSessions(options = {}) {
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
-    // Block-level `dirs` act as an additional exact-match filter (parity
-    // with opencode listing); connector-configured directories do the same.
-    const wantedPaths = new Set(
-      [...(directories.length ? directories : []), ...(this.directoryFilter() || [])].map((d) =>
-        path.normalize(d),
-      ),
-    );
+    // Block-level `dirs` act as an additional filter (parity with opencode
+    // listing); connector-configured directories do the same. Exact entries
+    // match cwd exactly; "/*" entries match the whole subtree.
+    const configured = [
+      ...(directories.length ? directories : []),
+      ...(this.directoryFilter() || []),
+    ];
+    const { exact: wantedPaths, subtree: wantedSubtrees } = splitDirGlobs(configured);
     const wantedSlugs = new Set([...wantedPaths].map((directory) => slugifyPath(directory)));
     const entries = await this.enumerateSessions();
     const rows = [];
@@ -2252,7 +2340,7 @@ class FileConnectorDriver extends ConnectorDriver {
       if (!fields) continue;
       // Filter AFTER scanning: codex resolves its directory from
       // session_meta during the scan.
-      if (!directoryMatchesFilter(entry, wantedPaths, wantedSlugs)) continue;
+      if (!directoryMatchesFilter(entry, wantedPaths, wantedSlugs, wantedSubtrees)) continue;
       const resolvedDirectory = displayDirectoryFor(entry, wantedPaths) || fields.directory || entry.directory;
       this.sessionStates.set(entry.id, fields.state || "idle");
       rows.push(
@@ -3215,7 +3303,6 @@ class OpenCode1Driver extends ConnectorDriver {
     }
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
     if (!directories.length) return [];
-    const directoryList = directories.map(quoteSql).join(", ");
     const customSql = validateSqlWhereFragment(
       options.customSql !== undefined ? options.customSql : settings.customSql,
     );
@@ -3225,7 +3312,19 @@ class OpenCode1Driver extends ConnectorDriver {
     const stateJoin =
       " LEFT JOIN message lm ON lm.session_id = session.id"
       + " AND lm.time_created = (SELECT MAX(time_created) FROM message WHERE session_id = session.id)";
-    const clauses = [`directory IN (${directoryList})`];
+    // Exact entries → IN list; "/*" entries → the directory itself plus
+    // everything beneath it (substr, not LIKE — see the v2 driver).
+    const { exact, subtree } = splitDirGlobs(directories);
+    const clauses = [];
+    if (exact.size) {
+      clauses.push(`session.directory IN (${[...exact].map(quoteSql).join(", ")})`);
+    }
+    for (const base of subtree) {
+      const prefix = `${base}/`;
+      clauses.push(
+        `(session.directory = ${quoteSql(base)} OR substr(session.directory, 1, ${prefix.length}) = ${quoteSql(prefix)})`,
+      );
+    }
     if (customSql) clauses.push(`(${customSql})`);
     const rows = (
       await runSqlite(
@@ -3778,6 +3877,7 @@ class SessionsDashboard {
     this.connectorEntry = null;
     this.connectorId = null;
     this.connectorError = null;
+    this.notices = { errors: [], warnings: [] };
   }
 
   // (Re)resolves the connector binding; runs on every load so default
@@ -3904,6 +4004,10 @@ class SessionsDashboard {
       }
     }
 
+    // Config-level notices between the toolbar and the list: errors first
+    // (e.g. `~` on an API-only connector), then warnings (e.g. subtree
+    // globs without direct database access, empty directory config).
+    this.noticesEl = container.createDiv({ cls: "opencode-sessions-notices" });
     this.errorEl = container.createDiv({ cls: "opencode-sessions-status" });
     this.listEl = container.createDiv({
       cls: this.layout() === "table" ? "opencode-sessions-table-wrap" : "opencode-sessions-cards",
@@ -3931,6 +4035,8 @@ class SessionsDashboard {
   async load() {
     if (this.disposed) return;
     this.refreshConnectorBinding();
+    this.notices = this.computeNotices();
+    this.renderNotices();
     if (this.connectorError) {
       this.errorEl.setText(`OpenCode sessions error: ${this.connectorError}`);
       this.sessions = [];
@@ -3974,6 +4080,90 @@ class SessionsDashboard {
       this.sessions = [...pinnedRows, ...missingRows];
     }
     this.render();
+  }
+
+  // Directory entries as configured (strings, trimmed) — before resolution,
+  // so `~` and "/*" markers stay visible for notices. Mirrors the source
+  // selection of resolveDirectories.
+  rawDirEntries() {
+    const config = this.connectorEntry?.connector?.config;
+    const raw = this.options.dirs !== undefined
+      ? this.options.dirs
+      : this.options.directories !== undefined
+        ? this.options.directories
+        : config?.directories;
+    return (Array.isArray(raw) ? raw : [raw])
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+  }
+
+  // Config-level notices for this dashboard: errors (misconfiguration that
+  // silently changes results) and warnings (entries ignored by the active
+  // listing mode). Recomputed on every load — the mode can flip when the
+  // database appears/disappears.
+  computeNotices() {
+    const notices = { errors: [], warnings: [] };
+    if (this.sessionsOnlyMode()) return notices;
+    const driver = this.driver();
+    const connector = this.connectorEntry?.connector;
+    if (!driver || !connector) return notices;
+    let capabilities = { home: true, subtree: true };
+    try {
+      capabilities = driver.directoryCapabilities?.() || capabilities;
+    } catch {
+      /* defaults hold */
+    }
+    const rawEntries = this.rawDirEntries();
+    if (!capabilities.home) {
+      const homeEntries = rawEntries.filter((entry) => entry.startsWith("~"));
+      if (homeEntries.length) {
+        notices.errors.push(
+          `Can't resolve ${homeEntries.map((entry) => `"${entry}"`).join(", ")} — connector "${connector.name}" has no local database, so "~" would expand to this machine's home, not the server's. Use absolute paths.`,
+        );
+        return notices; // those entries are left literal; glob checks moot
+      }
+    }
+    if (!capabilities.subtree) {
+      const globEntries = rawEntries.filter((entry) => entry.endsWith("/*"));
+      if (globEntries.length) {
+        notices.warnings.push(
+          `Subtree dirs (${globEntries.map((entry) => `"${entry}"`).join(", ")}) need direct database access — ignored on the API-only connector "${connector.name}".`,
+        );
+      }
+    }
+    if (connector.kind === "opencode2") {
+      let resolved = rawEntries;
+      try {
+        resolved = this.plugin.resolveDirectories(
+          { dirs: this.options.dirs, basedir: this.options.basedir },
+          connector,
+        ).directories;
+      } catch {
+        /* raw fallback below */
+      }
+      if (!resolved.length) {
+        notices.warnings.push(
+          'No directories configured — OpenCode listings are empty without explicit directories. Add them to the block (dirs:) or the connector\'s settings.',
+        );
+      }
+    }
+    return notices;
+  }
+
+  renderNotices() {
+    if (!this.noticesEl) return;
+    this.noticesEl.empty();
+    const { errors = [], warnings = [] } = this.notices || {};
+    for (const text of errors) {
+      const line = this.noticesEl.createDiv({ cls: "opencode-sessions-notice is-error" });
+      setIcon(line.createSpan({ cls: "opencode-sessions-notice-icon" }), "alert-circle");
+      line.createSpan({ cls: "opencode-sessions-notice-text", text });
+    }
+    for (const text of warnings) {
+      const line = this.noticesEl.createDiv({ cls: "opencode-sessions-notice is-warning" });
+      setIcon(line.createSpan({ cls: "opencode-sessions-notice-icon" }), "alert-triangle");
+      line.createSpan({ cls: "opencode-sessions-notice-text", text });
+    }
   }
 
   // Widget-level tag pin from the block config (`tags:` list or comma
@@ -7885,7 +8075,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Directories")
       .setDesc(
-        "Optional filter — one project directory per line; empty lists everything. Entries also disambiguate Claude/Cursor's lossy encoded project names.",
+        "Optional filter — one project directory per line; empty lists everything. Entries also disambiguate Claude/Cursor's lossy encoded project names. End an entry with /* to include everything beneath it; ~/ expands to your home folder.",
       )
       .addTextArea((text) => {
         text
@@ -7909,7 +8099,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Server URL override")
       .setDesc(
-        "Leave empty to auto-discover the local server via ~/.local/state/opencode/service.json (recommended). Set a URL (e.g. http://host:49374) for a remote OpenCode v2 server — listing then comes from its API unless the database below is also enabled and reachable.",
+        "Leave empty to auto-discover the local server via ~/.local/state/opencode/service.json (recommended). Set a URL (e.g. http://host:49374) for a remote OpenCode v2 server — listing then comes from its API unless the database below is also enabled and reachable. Without the database, directory entries must be absolute and exact: ~ and /* entries can't be used.",
       )
       .addText((text) =>
         text
@@ -7950,7 +8140,9 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Directories")
-      .setDesc("One OpenCode working directory per line. Add historical aliases if needed.")
+      .setDesc(
+        'One OpenCode working directory per line. Entries match the session\'s working directory exactly; end an entry with /* to include everything beneath it, and use ~/ for your home folder. Add historical aliases if needed.',
+      )
       .addTextArea((text) => {
         text
           .setValue(config.directories.join("\n"))
@@ -7968,7 +8160,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     if (!config.useDatabase) {
       const note = containerEl.createDiv({
         cls: "opencode-sessions-status",
-        text: "API listing mode: sessions come from the server's /api/session endpoint (custom SQL does not apply).",
+        text: "API listing mode: sessions come from the server's /api/session endpoint (custom SQL does not apply). Directory entries must be absolute and exact — ~ and /* entries are not supported without the local database.",
       });
       note.style.marginBottom = "0.5rem";
       return;
@@ -8595,17 +8787,41 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       new Notice("New sessions need an OpenCode v2 connector — set one as the default connector in settings.");
       return;
     }
-    const { directories } = this.resolveDirectories(options, entry.connector);
-    if (!directories.length) {
-      new Notice("No directories configured — add them in OpenCode Sessions settings.");
+    // `~` expands against the local home — meaningless for an API-only
+    // connector whose server runs on another machine (its home differs).
+    const capabilities = entry.driver.directoryCapabilities?.() || { home: true, subtree: true };
+    if (!capabilities.home) {
+      const homeEntries = this.rawDirectoryEntries(options, entry.connector).filter((entry_) =>
+        entry_.startsWith("~"),
+      );
+      if (homeEntries.length) {
+        new Notice(
+          `Can't resolve ${homeEntries.join(", ")} on "${entry.connector.name}" — the connector has no local database, so "~" would point at this machine, not the server. Use absolute paths.`,
+        );
+        return;
+      }
+    }
+    const { directories } = this.resolveDirectories(options, entry.connector, {
+      expandHome: capabilities.home,
+    });
+    // Subtree globs are listing filters, not working directories — new
+    // sessions start in exact directories only.
+    const { exact, subtree } = splitDirGlobs(directories);
+    if (!exact.size) {
+      new Notice(
+        subtree.size
+          ? "Subtree dirs (ending in /*) can't start sessions — add an exact directory."
+          : "No directories configured — add them in OpenCode Sessions settings.",
+      );
       return;
     }
+    const exactDirs = [...exact];
     const snippet = options.snippet || null;
-    if (directories.length === 1) {
-      await this.openSessionDraft(directories[0], entry.connector.id, snippet);
+    if (exactDirs.length === 1) {
+      await this.openSessionDraft(exactDirs[0], entry.connector.id, snippet);
       return;
     }
-    await this.activateNewSessionPicker(directories, entry.connector.id, snippet);
+    await this.activateNewSessionPicker(exactDirs, entry.connector.id, snippet);
   }
 
   async openSessionDraft(directory, connectorId = null, snippetConfig = null) {
@@ -8717,7 +8933,12 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
   // Normalizes directory options shared by listing and new-session picking.
   // Directory defaults come from the target connector's config.
-  resolveDirectories(options = {}, connector = null) {
+  // `~` / `~/…` entries expand against the local home unless { expandHome:
+  // false } — required for API-only listings of remote servers, where the
+  // local home would point at the wrong machine. Entries keep a trailing
+  // "/*" here; the listing gates (splitDirGlobs) decide what it means.
+  resolveDirectories(options = {}, connector = null, resolveOptions = {}) {
+    const expandHome = resolveOptions.expandHome !== false;
     const config = connector?.config || this.defaultConnectorConfig() || {};
     const requestedDirectories = options.dirs !== undefined
       ? options.dirs
@@ -8729,14 +8950,30 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     const rawBasedir = String(options.basedir || "").trim();
     // Normalize and drop trailing separators so prefix matching works.
     const basedir = rawBasedir
-      ? path.normalize(rawBasedir).replace(/[/\\]+$/, "") || path.sep
+      ? path.normalize(expandHome ? expandHomePath(rawBasedir) : rawBasedir).replace(/[/\\]+$/, "") || path.sep
       : "";
     const directories = [...new Set((Array.isArray(requestedDirectories) ? requestedDirectories : [requestedDirectories])
       .map((directory) => String(directory || "").trim())
       .filter(Boolean)
+      .map((directory) => (expandHome ? expandHomePath(directory) : directory))
       .map((directory) => (basedir && !path.isAbsolute(directory) ? path.join(basedir, directory) : directory))
       .map((directory) => path.normalize(directory)))];
     return { basedir, directories };
+  }
+
+  // Directory entries exactly as configured (strings, trimmed) — before
+  // resolution, so `~` and "/*" markers stay visible for notices and
+  // validation. Mirrors resolveDirectories' source selection.
+  rawDirectoryEntries(options = {}, connector = null) {
+    const config = connector?.config || this.defaultConnectorConfig() || {};
+    const requestedDirectories = options.dirs !== undefined
+      ? options.dirs
+      : options.directories !== undefined
+        ? options.directories
+        : config.directories;
+    return (Array.isArray(requestedDirectories) ? requestedDirectories : [requestedDirectories])
+      .map((directory) => String(directory || "").trim())
+      .filter(Boolean);
   }
 
   // Rows are decorated once here so every consumer (plugin view, Datacore JSX)
