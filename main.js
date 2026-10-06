@@ -1442,10 +1442,26 @@ class OpenCodeClient {
   }
 
   // Full session list (used when the local database is unavailable — e.g.
-  // remote servers). Each item: id, title, agent, model, cost, tokens,
-  // time{created,updated,…}, location{directory}.
-  listSessions() {
-    return this.request("/api/session", { timeoutMs: 20000 });
+  // remote servers). The endpoint is cursor-paginated (newest 50 by
+  // default); follow cursor.next until exhausted so directory filtering —
+  // including subtree globs — sees the whole tree, like the TUI does.
+  // Each item: id, title, agent, model, cost, tokens, time{…},
+  // location{directory}.
+  async listSessions() {
+    const pageSize = 500;
+    const data = [];
+    let cursor = null;
+    // Hard cap (30k sessions) guards against a server that keeps paging.
+    for (let page = 0; page < 60; page += 1) {
+      const query = new URLSearchParams({ limit: String(pageSize) });
+      if (cursor) query.set("cursor", cursor);
+      const response = await this.request(`/api/session?${query.toString()}`, { timeoutMs: 20000 });
+      const items = Array.isArray(response?.data) ? response.data : [];
+      data.push(...items);
+      cursor = response?.cursor?.next || null;
+      if (!cursor || items.length < pageSize) break;
+    }
+    return { data };
   }
 
   messages(sessionId, options = {}) {
@@ -1968,13 +1984,13 @@ class OpenCode2Driver extends ConnectorDriver {
   }
 
   // Directory-resolution capabilities, consulted by dashboards and the
-  // new-session flow. Direct local access (database listing) can expand
-  // `~` against the local home and honor subtree (`/*`) entries; an
-  // API-only listing (remote connector, or the database moved away) can
-  // do neither — the remote server's home and tree are unknowable.
+  // new-session flow. `~` needs the local home, so it requires direct
+  // database access — an API-only listing of a remote server must not
+  // expand it (the remote home differs). Subtree (`/*`) entries work in
+  // both modes: the API listing pages the full tree and matches
+  // client-side.
   directoryCapabilities() {
-    const usable = this.databaseUsable();
-    return { home: usable, subtree: usable };
+    return { home: this.databaseUsable(), subtree: true };
   }
 
   async listSessions(options = {}) {
@@ -1983,24 +1999,28 @@ class OpenCode2Driver extends ConnectorDriver {
   }
 
   async listSessionsFromApi(options = {}) {
-    // No local filesystem context here: `~` stays literal (it can never
-    // match — the remote home differs) and subtree globs are not applied
-    // (the API exposes no tree guarantee). The dashboard surfaces both
-    // as notices; entries must be absolute + exact for remote connectors.
+    // No local filesystem context here: `~` stays literal (the remote home
+    // is unknowable — the dashboard surfaces an error) and must be given
+    // as absolute paths. Subtree globs are fine: the client pages the
+    // whole session list and boundary-matches client-side.
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector, {
       expandHome: false,
     });
     const response = await this.client.listSessions();
     const list = Array.isArray(response?.data) ? response.data : [];
-    const { exact: wanted } = splitDirGlobs(directories);
+    const { exact: wanted, subtree } = splitDirGlobs(directories);
     const rows = list
       .filter((session) => {
         // Explicit id lookups bypass the directory filter entirely.
         if (options.allDirectories) return true;
         // Parity with the DB path: no configured directories → no rows.
-        if (!wanted.size) return false;
-        const directory = session?.location?.directory || "";
-        return wanted.has(path.normalize(directory));
+        if (!wanted.size && !subtree.size) return false;
+        const directory = path.normalize(session?.location?.directory || "");
+        if (wanted.has(directory)) return true;
+        for (const base of subtree) {
+          if (directoryInSubtree(directory, base)) return true;
+        }
+        return false;
       })
       .map((session) => this.apiSessionRow(session, basedir));
     return rows.sort((a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0));
@@ -8099,7 +8119,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Server URL override")
       .setDesc(
-        "Leave empty to auto-discover the local server via ~/.local/state/opencode/service.json (recommended). Set a URL (e.g. http://host:49374) for a remote OpenCode v2 server — listing then comes from its API unless the database below is also enabled and reachable. Without the database, directory entries must be absolute and exact: ~ and /* entries can't be used.",
+        "Leave empty to auto-discover the local server via ~/.local/state/opencode/service.json (recommended). Set a URL (e.g. http://host:49374) for a remote OpenCode v2 server — listing then comes from its API unless the database below is also enabled and reachable. Without the database, directory entries must be absolute (~ can't be resolved against a remote server); /* subtrees work.",
       )
       .addText((text) =>
         text
@@ -8160,7 +8180,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     if (!config.useDatabase) {
       const note = containerEl.createDiv({
         cls: "opencode-sessions-status",
-        text: "API listing mode: sessions come from the server's /api/session endpoint (custom SQL does not apply). Directory entries must be absolute and exact — ~ and /* entries are not supported without the local database.",
+        text: "API listing mode: sessions come from the server's /api/session endpoint (custom SQL does not apply). Directory entries must be absolute — ~ can't be resolved against a remote server; /* subtrees are matched client-side over the full paginated listing.",
       });
       note.style.marginBottom = "0.5rem";
       return;

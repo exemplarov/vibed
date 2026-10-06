@@ -45,10 +45,11 @@ chats that don't name one) — pick it in settings.
   `GET /api/session`.
 - **Remote**: set a *Server URL override* (and password). The override is
   authoritative — no silent fallback to a local server. Pair with API-only
-  listing, or point at a reachable DB path for hybrid mode. Without the
-  local database, `dirs` entries must be absolute and exact — `~` and
-  `/*` (subtree) entries can't be resolved against a remote server and
-  surface an error/warning in the dashboard instead.
+  listing, or point at a reachable DB path for hybrid mode. API listing
+  pages the server's `/api/session` (cursor-based, like the TUI) and
+  filters client-side, so `/*` subtrees work — but `dirs` entries must be
+  absolute: `~` can't be resolved against a remote server and surfaces an
+  error in the dashboard instead.
 
 ### Backend caveats
 
@@ -136,7 +137,7 @@ Options (simple `key: value` lines or a JSON object):
 | Option | Default | Description |
 | --- | --- | --- |
 | `connector` | default connector | Connector **name** (e.g. `claude`, `codex-2`). Unknown names render an inline error. |
-| `dirs` | connector setting | Directories to list sessions for. Relative entries resolve against `basedir`; `~/…` expands to your home folder; an entry ending in `/*` matches the whole subtree (the entry's directory plus everything beneath it) — plain entries match the session's working directory exactly. Subtree and `~` entries need direct local access: on OpenCode connectors without the local database (remote, API-only listing) they are rejected with a notice in the dashboard. On OpenCode connectors this **overrides** the connector's configured directories; on Claude/Codex/Cursor it **adds to** them (a filter). |
+| `dirs` | connector setting | Directories to list sessions for. Relative entries resolve against `basedir`; `~/…` expands to your home folder (local-access listings only — API-only remote connectors reject it with a dashboard error); an entry ending in `/*` matches the whole subtree (the entry's directory plus everything beneath it) in every listing mode — plain entries match the session's working directory exactly. On OpenCode connectors this **overrides** the connector's configured directories; on Claude/Codex/Cursor it **adds to** them (a filter). |
 | `sessions` | – | Explicit session ids (list). With **only** `sessions` the block renders a clean widget: just the cards, no toolbar. Missing ids render as dashed "(not found)" cards. |
 | `basedir` | – | Prefix for relative `dirs`; cards/tables show directories relative to it. |
 | `tags` | – | Only sessions whose note carries **all** of these tags (list or comma string; intersected with `dirs`). |

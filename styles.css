@@ -28,13 +28,14 @@
   margin-bottom: 0.5rem;
 }
 
-/* Config-level notices: errors (misconfiguration that silently changes
-   results) and warnings (entries ignored by the active listing mode). */
+/* Config-level notices: small icon + text lines, errors (misconfiguration
+   that silently changes results) above warnings (entries ignored by the
+   active listing mode). Deliberately quiet — no filled background. */
 .opencode-sessions-notices {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
-  margin-bottom: 0.5rem;
+  gap: 0.25rem;
+  margin-bottom: 0.4rem;
 }
 
 .opencode-sessions-notices:empty {
@@ -43,36 +44,33 @@
 
 .opencode-sessions-notice {
   display: flex;
-  align-items: flex-start;
-  gap: 0.4rem;
-  padding: 0.35rem 0.6rem;
-  border-radius: var(--radius-s, 4px);
+  align-items: baseline;
+  gap: 0.35rem;
   font-size: var(--font-smaller);
 }
 
-.opencode-sessions-notice.is-error {
-  color: var(--text-error, #e93147);
-  background: var(--background-modifier-error, rgba(255, 45, 85, 0.1));
-}
-
-.opencode-sessions-notice.is-warning {
-  color: var(--text-warning, #e0ac00);
-  background: var(--background-modifier-border, rgba(255, 200, 0, 0.08));
-}
-
-.opencode-sessions-notice-icon {
+.opencode-sessions-notice .opencode-sessions-notice-icon {
   flex: none;
-  display: inline-flex;
-  margin-top: 0.1rem;
+  align-self: center;
+  color: var(--text-warning, #e0ac00);
 }
 
-.opencode-sessions-notice-icon .svg-icon {
-  width: 14px;
-  height: 14px;
+.opencode-sessions-notice.is-error .opencode-sessions-notice-icon {
+  color: var(--text-error, #e93147);
+}
+
+.opencode-sessions-notice .opencode-sessions-notice-icon .svg-icon {
+  width: 13px;
+  height: 13px;
 }
 
 .opencode-sessions-notice-text {
   min-width: 0;
+  color: var(--text-muted);
+}
+
+.opencode-sessions-notice.is-error .opencode-sessions-notice-text {
+  color: var(--text-error, #e93147);
 }
 
 .opencode-sessions-datacore {
