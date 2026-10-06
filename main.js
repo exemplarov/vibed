@@ -4138,7 +4138,7 @@ class SessionsDashboard {
       const homeEntries = rawEntries.filter((entry) => entry.startsWith("~"));
       if (homeEntries.length) {
         notices.errors.push(
-          `Can't resolve ${homeEntries.map((entry) => `"${entry}"`).join(", ")} — connector "${connector.name}" has no local database, so "~" would expand to this machine's home, not the server's. Use absolute paths.`,
+          `${homeEntries.map((entry) => `"${entry}"`).join(", ")} — not supported for remote connectors; use absolute paths.`,
         );
         return notices; // those entries are left literal; glob checks moot
       }
@@ -8816,7 +8816,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       );
       if (homeEntries.length) {
         new Notice(
-          `Can't resolve ${homeEntries.join(", ")} on "${entry.connector.name}" — the connector has no local database, so "~" would point at this machine, not the server. Use absolute paths.`,
+          `${homeEntries.join(", ")} — not supported for remote connectors; use absolute paths.`,
         );
         return;
       }

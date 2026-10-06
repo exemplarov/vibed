@@ -379,7 +379,7 @@ const check = (name, fn) => {
       return dash.computeNotices();
     };
     const homeNotices = collect({ dirs: ["~/*"] });
-    if (!homeNotices.errors.length || !/Can't resolve/.test(homeNotices.errors[0])) {
+    if (!homeNotices.errors.length || !/not supported for remote/.test(homeNotices.errors[0])) {
       throw new Error(`~ entry must error: ${JSON.stringify(homeNotices)}`);
     }
     if (homeNotices.warnings.length) throw new Error("~ error should take precedence over glob warning");
