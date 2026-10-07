@@ -15,7 +15,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.18.0-blue)
+![version](https://img.shields.io/badge/version-0.19.0-blue)
 [![Obsidian community plugin](https://img.shields.io/badge/Obsidian-community%20plugin-7c3aed)](https://community.obsidian.md/plugins/vibed)
 
 ## Connectors
@@ -74,6 +74,9 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Subsessions (task-tool subagents)**: subagent sessions never clutter the list — they nest under their parent's card. A parent waiting on running subagents gets a **Subagents running** state (derived — OpenCode reports parent and child both as plain "running"), and the card lists its subsessions: active ones by default, all via the expand toggle. Table layout nests the same strip in a sub-row. Opening a subsession chat shows a **subsession** chip in the header that links back to the main session.
 - **Session chat view**: messages stream in live (text + reasoning + tool calls with input/output); history loads the newest page first and pages in older messages as you scroll to the top. Works for every connector (read-only ones simply don't stream).
+- **Jump to latest**: scroll up and a floating button appears above the composer; it counts the messages that arrived while you were away and snaps back to the newest message on click. Sending always jumps back down.
+- **Slash commands**: type `/` in the composer to get the TUI's command menu — filter by name, `↑`/`↓` to move, `Tab`/`Enter` to complete (an exact name sends right away). Commands run server-side via the command endpoint with arguments, multi-line included; unknown `/names` are sent as plain prompts, like the TUI.
+- **Session environment popup**: a header button shows what the server provides for the session's directory — MCP servers with live statuses (connect/disconnect inline, errors shown), slash commands, and skills. Same picture as the TUI sidebar, one Refresh away.
 - **Find in chat**: `Ctrl+F` / `Cmd+F` opens a browser-style find bar over the transcript — live match count, all-matches highlighting, `Enter`/`Shift+Enter` (also `F3`, `Cmd/Ctrl+G`) to navigate with wrap-around, `Aa` toggles case sensitivity, `Esc` closes and restores focus. Searches exactly what's on screen: collapsed Thinking / tool Input / Output sections are skipped until you expand them (expanding re-runs the search live), and streaming or newly paged-in messages refresh the results automatically.
 - **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message. Each directory card carries a **⋮ menu** with the working-directory actions — copy path, open in the file manager, open in a terminal — so you can inspect a candidate before picking it.

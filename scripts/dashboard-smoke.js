@@ -17,7 +17,7 @@ src = src.replace(
   obsidianLine,
   `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class {}, TFile = class {}, TFolder = class {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, normalizeMcpList, normalizeCommandList, normalizeSkillList };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
@@ -41,6 +41,12 @@ const {
   applyAgentReference,
   analyzeVibedLine,
   normalizeTagList,
+  composerCommandQuery,
+  filterCommands,
+  parseComposerCommand,
+  normalizeMcpList,
+  normalizeCommandList,
+  normalizeSkillList,
 } = require(tmp);
 
 function makeEl(tag, opts = {}) {
@@ -475,6 +481,74 @@ const check = (name, fn) => {
     if (JSON.stringify(normalizeTagList(["a", "b", "a"])) !== JSON.stringify(["a", "b"])) throw new Error("array input wrong");
     if (JSON.stringify(normalizeTagList("a, b ,a")) !== JSON.stringify(["a", "b"])) throw new Error("string input wrong");
     if (normalizeTagList("").length) throw new Error("empty input must yield empty list");
+  });
+
+  check("composerCommandQuery detects a leading slash word only", () => {
+    if (composerCommandQuery("/ini") !== "ini") throw new Error("slash word must extract");
+    if (composerCommandQuery("/") !== "") throw new Error("bare slash is a valid empty query");
+    if (composerCommandQuery("/init arg") !== null) throw new Error("space must close the command word");
+    if (composerCommandQuery("/ini\nmore") !== null) throw new Error("newline must close the command word");
+    if (composerCommandQuery("hi /ini") !== null) throw new Error("mid-text slash must not match");
+    if (composerCommandQuery("") !== null || composerCommandQuery(null) !== null) throw new Error("empty input must be null");
+  });
+
+  check("filterCommands matches substrings case-insensitively", () => {
+    const commands = [{ name: "init" }, { name: "review" }, { name: null }];
+    if (filterCommands(commands, "in").length !== 1 || filterCommands(commands, "in")[0].name !== "init") {
+      throw new Error("substring match wrong");
+    }
+    if (filterCommands(commands, "REV").length !== 1) throw new Error("case-insensitive match wrong");
+    if (filterCommands(commands, "").length !== 2) throw new Error("empty query lists all named commands");
+    if (filterCommands(null, "x").length) throw new Error("null list must be empty");
+  });
+
+  check("parseComposerCommand splits name and multi-line arguments", () => {
+    const simple = parseComposerCommand("/init");
+    if (!simple || simple.name !== "init" || simple.args !== "") throw new Error("bare command wrong");
+    const withArgs = parseComposerCommand("/review branch main\nextra line");
+    if (!withArgs || withArgs.name !== "review") throw new Error("name wrong");
+    if (withArgs.args !== "branch main\nextra line") throw new Error(`args wrong: ${JSON.stringify(withArgs.args)}`);
+    const multilineOnly = parseComposerCommand("/cmd\nline one\nline two");
+    if (multilineOnly.args !== "line one\nline two") throw new Error("newline args wrong");
+    if (parseComposerCommand("plain text") !== null) throw new Error("plain text must not parse");
+    if (parseComposerCommand("/ spaced") !== null) throw new Error("empty name must not parse");
+    if (parseComposerCommand("//x") === null || parseComposerCommand("//x").name !== "/x") {
+      throw new Error("double slash is a (weird) name — must still parse deterministically");
+    }
+  });
+
+  check("normalizeMcpList accepts wrapped arrays and status records", () => {
+    const v1 = normalizeMcpList({
+      location: { directory: "/x" },
+      data: [
+        { name: "zed", status: { status: "connected" } },
+        { name: "abc", status: { status: "failed", error: "boom" } },
+      ],
+    });
+    if (v1.length !== 2 || v1[0].name !== "abc") throw new Error("v1 shape or sort wrong");
+    if (v1[0].status !== "failed" || v1[0].error !== "boom") throw new Error("v1 failure fields wrong");
+    if (v1[1].status !== "connected" || v1[1].error !== "") throw new Error("v1 connected fields wrong");
+    const record = normalizeMcpList({ data: { one: { status: "disabled" }, two: "needs_auth" } });
+    if (record.length !== 2 || record[1].name !== "two" || record[1].status !== "needs_auth") {
+      throw new Error("record shape wrong");
+    }
+    const bare = normalizeMcpList({ three: { status: "connected" } });
+    if (bare.length !== 1 || bare[0].status !== "connected") throw new Error("unwrapped record must work");
+    if (normalizeMcpList(null).length || normalizeMcpList({}).length) throw new Error("empty inputs must yield []");
+  });
+
+  check("normalizeCommandList and normalizeSkillList normalize wraps", () => {
+    const wrapped = normalizeCommandList({ data: [{ name: "init", description: "setup" }, { name: "review" }, {}] });
+    if (wrapped.length !== 2 || wrapped[0].name !== "init" || wrapped[0].description !== "setup") {
+      throw new Error("command wrap wrong");
+    }
+    if (wrapped[1].description !== "") throw new Error("missing description must default to empty");
+    const bare = normalizeCommandList([{ name: "x" }]);
+    if (bare.length !== 1 || bare[0].name !== "x") throw new Error("bare array must work");
+    const skills = normalizeSkillList({ data: [{ id: "b" }, { id: "a", description: "does things" }, { }] });
+    if (skills.length !== 2 || skills[0].name !== "a" || skills[0].description !== "does things") {
+      throw new Error("skill normalization wrong");
+    }
   });
 
   fs.unlinkSync(tmp);

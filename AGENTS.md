@@ -14,10 +14,11 @@ transcripts for OpenCode v1 / Claude Code / Codex / Cursor.
   stubbed DOM + pure-function checks). Both must pass.
 - Desktop-only by design (`isDesktopOnly: true`): the plugin spawns
   `sqlite3`/`zstd` helpers and talks to local servers.
-- Design docs are specs: `spec/001…007` (connector architecture,
+- Design docs are specs: `spec/001…009` (connector architecture,
   implementation plan, session notes, tags, find-in-chat, header menu,
-  snippet config). New features get a numbered spec **before** shipping;
-  status line says `implemented (vX.Y.Z)` when done.
+  snippet config, authoring UX, chat environment/commands). New features get
+  a numbered spec **before** shipping; status line says
+  `implemented (vX.Y.Z)` when done.
 - Session reports go to `reports/YYYY-MM-DD_vibed_<topic>.md`.
 
 ## Code map (main.js, top to bottom)
@@ -30,7 +31,7 @@ transcripts for OpenCode v1 / Claude Code / Codex / Cursor.
 | connectors | per-kind drivers (OpenCode v2/v1, Claude, Codex, Cursor) + `ConnectorRegistry` |
 | session notes | `SessionNotes` — vault files attached by `session:` frontmatter, Obsidian-semantics tags |
 | dashboard | `SessionsDashboard` (shared by view + embedded blocks), `SessionsDashboardChild` |
-| chat view | `SessionChatView`, `NewSessionView`, find-in-chat, approvals/questions |
+| chat view | `SessionChatView`, `NewSessionView`, find-in-chat, approvals/questions, jump-to-latest, slash commands, `SessionEnvironmentModal` |
 | settings tab | connector cards |
 | authoring UI | `VibedBlockSuggest` (EditorSuggest), `VibedInsertModal`, `AgentReferenceFolderModal` |
 | plugin | command/view/protocol registration, listing/routing, `globalThis.vibed` API (version 4) |

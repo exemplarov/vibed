@@ -1509,6 +1509,11 @@ class OpenCodeClient {
     this.endpoint = null;
     this.endpointAt = 0;
     this.healthInfo = null;
+    // Payload dialects learned on first use (spec/009): the command
+    // endpoint renamed its body between server generations, and the MCP
+    // per-server actions moved off /api/experimental/….
+    this.commandShape = null;
+    this.mcpActionPrefix = null;
   }
 
   invalidate() {
@@ -1792,6 +1797,64 @@ class OpenCodeClient {
     });
   }
 
+  commands(directory) {
+    return this.request(`/api/command${this.locationQuery(directory)}`, { timeoutMs: 10000 });
+  }
+
+  mcpList(directory) {
+    return this.request(`/api/mcp${this.locationQuery(directory)}`, { timeoutMs: 10000 });
+  }
+
+  // Executes a slash command (TUI "/" commands). Payload dialects differ:
+  // released v2 servers take {name, text}; newer builds renamed it to
+  // {command, arguments}. The v1 shape is tried first (a 4xx means pure
+  // validation failure — nothing executed, so the retry is safe); whichever
+  // succeeds is cached per connector. v1 servers answer 204 with no body —
+  // the created message arrives through the event stream.
+  async runCommand(sessionId, name, text) {
+    const pathname = `/api/session/${encodeURIComponent(sessionId)}/command`;
+    if (this.commandShape !== "v2") {
+      try {
+        const response = await this.request(pathname, { method: "POST", body: { name, text } });
+        this.commandShape = "v1";
+        return response;
+      } catch (error) {
+        if (!/^4\d\d/.test(String(error.message))) throw error;
+      }
+    }
+    const response = await this.request(pathname, {
+      method: "POST",
+      body: { command: name, arguments: text },
+    });
+    this.commandShape = "v2";
+    return response;
+  }
+
+  // MCP per-server actions (connect/disconnect). Released v2 exposes them
+  // under /api/experimental/mcp/…, newer builds moved them to /api/mcp/… —
+  // probe in order and cache the working prefix. A connect on an OAuth
+  // server may reply with an authorizationUrl the caller must open.
+  async mcpServerAction(name, action) {
+    const suffix = `mcp/${encodeURIComponent(name)}/${action}`;
+    const prefixes = this.mcpActionPrefix
+      ? [this.mcpActionPrefix]
+      : ["/api/experimental/", "/api/"];
+    let lastError = null;
+    for (const prefix of prefixes) {
+      try {
+        const response = await this.request(`${prefix}${suffix}`, { method: "POST", timeoutMs: 30000 });
+        if (!this.mcpActionPrefix) this.mcpActionPrefix = prefix;
+        return response ?? {};
+      } catch (error) {
+        lastError = error;
+        // Only a wrong path (404/405) justifies the next prefix; auth,
+        // network, and server errors fail identically for both.
+        if (!/^40[45]/.test(String(error.message))) throw error;
+      }
+    }
+    throw lastError;
+  }
+
   interrupt(sessionId) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/interrupt`, {
       method: "POST",
@@ -2057,6 +2120,8 @@ class OpenCode2Driver extends ConnectorDriver {
       agents: true,
       permissions: true,
       questions: true,
+      commands: true,
+      mcp: true,
       drafts: true,
       tokens: true,
       cost: true,
@@ -4954,6 +5019,111 @@ class OpenCodeSessionsView extends ItemView {
 }
 
 // ---------------------------------------------------------------------------
+// Chat composer helpers (spec/009): slash-command parsing plus server-list
+// normalizers. Pure functions — covered by scripts/dashboard-smoke.js.
+// ---------------------------------------------------------------------------
+
+// The composer is "typing a slash command word" while the text starts with
+// "/" and no whitespace has closed the first token yet. Returns the filter
+// (the text after the slash) or null.
+function composerCommandQuery(value) {
+  const match = /^\/([^\s/]*)$/.exec(String(value || ""));
+  return match ? match[1] : null;
+}
+
+// Case-insensitive substring filter over the loaded command list.
+function filterCommands(commands, query) {
+  const needle = String(query || "").toLowerCase();
+  return (Array.isArray(commands) ? commands : []).filter((command) =>
+    command?.name ? !needle || String(command.name).toLowerCase().includes(needle) : false,
+  );
+}
+
+// TUI-compatible split: the first word of the first line is the command name
+// (without the "/"); everything after it — the first-line remainder plus any
+// further lines — is the arguments string. Null when the text does not start
+// with a /command.
+function parseComposerCommand(text) {
+  const input = String(text || "");
+  const firstLineEnd = input.indexOf("\n");
+  const firstLine = firstLineEnd === -1 ? input : input.slice(0, firstLineEnd);
+  const spaceAt = firstLine.indexOf(" ");
+  const head = spaceAt === -1 ? firstLine : firstLine.slice(0, spaceAt);
+  if (!head.startsWith("/") || head.length < 2) return null;
+  const firstLineArgs = spaceAt === -1 ? "" : firstLine.slice(spaceAt + 1);
+  const restLines = firstLineEnd === -1 ? "" : input.slice(firstLineEnd + 1);
+  return { name: head.slice(1), args: [firstLineArgs, restLines].filter(Boolean).join("\n") };
+}
+
+// /api/mcp replies differ across server generations: released v2 wraps an
+// array ({location, data: [{name, status: {status, error?}}]}), newer builds
+// return a name → status record, possibly without the wrapper. Normalized to
+// [{ name, status, error }], sorted by name.
+function normalizeMcpList(response) {
+  const body =
+    response && (Array.isArray(response.data) || isPlainObject(response.data)) ? response.data : response;
+  const list = [];
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      if (!item?.name) continue;
+      const status = isPlainObject(item.status) ? item.status : {};
+      list.push({
+        name: String(item.name),
+        status: String(status.status || (typeof item.status === "string" ? item.status : "") || "unknown"),
+        error: String(status.error || item.error || ""),
+      });
+    }
+  } else if (isPlainObject(body)) {
+    for (const [name, value] of Object.entries(body)) {
+      const status = typeof value === "string" ? { status: value } : isPlainObject(value) ? value : {};
+      list.push({
+        name,
+        status: String(status.status || "unknown"),
+        error: String(status.error || ""),
+      });
+    }
+  }
+  list.sort((a, b) => a.name.localeCompare(b.name));
+  return list;
+}
+
+// /api/command replies: {data: [{name, description?}]} (v1 wrap) or a bare
+// array. Normalized to [{name, description}], sorted by name.
+function normalizeCommandList(response) {
+  const body = Array.isArray(response?.data) ? response.data : Array.isArray(response) ? response : [];
+  const list = [];
+  for (const item of body) {
+    if (!item?.name) continue;
+    list.push({ name: String(item.name), description: String(item.description || "") });
+  }
+  list.sort((a, b) => a.name.localeCompare(b.name));
+  return list;
+}
+
+// /api/skill replies share the v1 wrap; items carry id (spec/007 used ids).
+function normalizeSkillList(response) {
+  const body = Array.isArray(response?.data) ? response.data : Array.isArray(response) ? response : [];
+  const list = [];
+  for (const item of body) {
+    const name = item?.id || item?.name;
+    if (!name) continue;
+    list.push({ name: String(name), description: String(item?.description || "") });
+  }
+  list.sort((a, b) => a.name.localeCompare(b.name));
+  return list;
+}
+
+// Status labels for the environment popup, mirroring the TUI's MCP sidebar
+// (connected/disabled/failed/needs auth/needs client registration).
+const MCP_STATUS_META = {
+  connected: { label: "Connected", cls: "connected" },
+  disabled: { label: "Disabled", cls: "disabled" },
+  failed: { label: "Failed", cls: "failed" },
+  needs_auth: { label: "Needs auth", cls: "auth" },
+  needs_client_registration: { label: "Needs client ID", cls: "failed" },
+};
+
+// ---------------------------------------------------------------------------
 // Session chat view. Streams the conversation in real time from the shared
 // /api/event connection; prompt + interrupt included.
 // ---------------------------------------------------------------------------
@@ -5022,6 +5192,17 @@ class SessionChatView extends ItemView {
     this.findRefreshTimer = null;
     this.findRestoreFocus = null;
     this.findTargetEl = null;
+    // Jump-to-latest (spec/009): unread bookkeeping while the transcript is
+    // scrolled away from the newest message.
+    this.awayUnread = 0;
+    // Slash commands (spec/009): per-directory command list plus the
+    // composer autocomplete menu state (cmdQuery null = menu closed).
+    this.commands = [];
+    this.cmdMenuEl = null;
+    this.cmdListEl = null;
+    this.cmdRows = [];
+    this.cmdIndex = -1;
+    this.cmdQuery = null;
   }
 
   getViewType() {
@@ -5151,6 +5332,7 @@ class SessionChatView extends ItemView {
       this.updateComposer();
       this.loadModels().catch(() => {});
       this.loadAgents().catch(() => {});
+      this.loadCommands().catch(() => {});
       return;
     }
     this.contentEl.createDiv({ cls: "opencode-session-empty", text: "No session selected." });
@@ -5239,6 +5421,19 @@ class SessionChatView extends ItemView {
     });
     setIcon(this.findButton, "search");
     this.findButton.addEventListener("click", () => this.openFind());
+    // Environment popup (spec/009): MCP servers, commands, and skills the
+    // server exposes for this session's directory. v2-only endpoints.
+    this.envButton = headerActions.createEl("button", {
+      cls: "oc-icon-button oc-env-toggle",
+      attr: {
+        "aria-label": "Session environment",
+        title: "Session environment — MCP servers, commands, skills",
+      },
+    });
+    setIcon(this.envButton, "plug-zap");
+    const envCaps = this.driverCapabilities();
+    this.envButton.style.display = envCaps.mcp || envCaps.commands ? "" : "none";
+    this.envButton.addEventListener("click", () => this.showEnvironment());
     this.notesButton = headerActions.createEl("button", {
       cls: "oc-icon-button oc-notes-toggle",
       attr: { "aria-label": "Session notes" },
@@ -5293,7 +5488,9 @@ class SessionChatView extends ItemView {
     // Infinite scroll upward: in a column-reverse container scrollTop is 0 at
     // the bottom and most negative at the visual top, so hitting the top of
     // the loaded history pages in the previous 100 messages automatically.
+    // The same listener updates the jump-to-latest button's visibility.
     this.chatEl.addEventListener("scroll", () => {
+      this.updateJumpButton();
       if (this.loadingOlder || !this.cursorOlder || this.offline) return;
       const el = this.chatEl;
       const visualTop = -(el.scrollHeight - el.clientHeight);
@@ -5361,6 +5558,18 @@ class SessionChatView extends ItemView {
     this.questionEl.style.display = "none";
 
     const composer = main.createDiv({ cls: "oc-composer" });
+    // Jump-to-latest (spec/009): floats above the composer's right edge
+    // while the user is scrolled up, counting messages that arrived since.
+    // Anchored to the composer (position: relative) so textarea growth
+    // never overlaps it. Purely client-side — every connector gets it.
+    this.jumpButton = composer.createEl("button", {
+      cls: "oc-icon-button oc-jump",
+      attr: { "aria-label": "Jump to latest", title: "Jump to latest messages" },
+    });
+    setIcon(this.jumpButton, "chevrons-down");
+    this.jumpBadgeEl = this.jumpButton.createSpan({ cls: "oc-jump-badge", text: "" });
+    this.jumpButton.addEventListener("click", () => this.jumpToBottom());
+    this.jumpButton.style.display = "none";
     const caps = this.driverCapabilities();
     this.readOnly = !caps.chat;
     if (this.readOnly) {
@@ -5390,13 +5599,15 @@ class SessionChatView extends ItemView {
       cls: "oc-input",
       attr: { placeholder: "Message this session… (Enter to send, Shift+Enter for newline)", rows: "1" },
     });
-    this.inputEl.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        this.send();
-      }
+    this.inputEl.addEventListener("keydown", (event) => this.onComposerKeydown(event));
+    this.inputEl.addEventListener("input", () => {
+      this.autoGrow();
+      this.updateCommandMenu();
     });
-    this.inputEl.addEventListener("input", () => this.autoGrow());
+    // Slash-command autocomplete (spec/009): anchored above the input while
+    // the composer text is a leading "/word", mirroring the TUI.
+    this.cmdMenuEl = composer.createDiv({ cls: "oc-cmdmenu", attr: { hidden: "" } });
+    this.cmdListEl = this.cmdMenuEl.createDiv({ cls: "oc-cmdmenu-list" });
     const actions = composer.createDiv({ cls: "oc-composer-actions" });
     this.agentSelect = actions.createEl("select", { cls: "oc-agent-select" });
     this.agentSelect.title = "Agent";
@@ -5416,6 +5627,148 @@ class SessionChatView extends ItemView {
   autoGrow() {
     this.inputEl.style.height = "auto";
     this.inputEl.style.height = `${Math.min(this.inputEl.scrollHeight, 160)}px`;
+  }
+
+  // ----- jump to latest (spec/009) --------------------------------------------
+
+  // column-reverse: scrollTop 0 is the newest message (visual bottom);
+  // anything more negative than the threshold counts as "scrolled away".
+  chatAtBottom(threshold = 60) {
+    const el = this.chatEl;
+    return !el || el.scrollTop >= -threshold;
+  }
+
+  updateJumpButton() {
+    if (!this.jumpButton) return;
+    const away = !this.chatAtBottom();
+    this.jumpButton.style.display = away ? "" : "none";
+    // Returning to the bottom (however it happened) re-arms the counter.
+    if (!away) this.awayUnread = 0;
+    if (this.jumpBadgeEl) {
+      this.jumpBadgeEl.setText(this.awayUnread > 9 ? "9+" : this.awayUnread ? String(this.awayUnread) : "");
+    }
+  }
+
+  jumpToBottom(instant = false) {
+    const el = this.chatEl;
+    if (!el) return;
+    this.awayUnread = 0;
+    this.updateJumpButton();
+    if (instant) el.scrollTop = 0;
+    else el.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // ----- slash commands (spec/009) --------------------------------------------
+
+  onComposerKeydown(event) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      // With the menu open, Enter completes the highlighted command — or
+      // sends outright when the typed word already is an exact name.
+      if (this.cmdQuery !== null && this.cmdRows.length) {
+        event.preventDefault();
+        const exact = this.cmdRows.find((command) => command.name === this.cmdQuery) || null;
+        if (exact) this.send();
+        else this.applyCommandSelection(this.cmdRows[Math.max(this.cmdIndex, 0)]);
+        return;
+      }
+      event.preventDefault();
+      this.send();
+      return;
+    }
+    if (this.cmdQuery !== null) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        this.moveCommandSelection(event.key === "ArrowDown" ? 1 : -1);
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        if (this.cmdRows.length) this.applyCommandSelection(this.cmdRows[Math.max(this.cmdIndex, 0)]);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeCommandMenu();
+        return;
+      }
+    }
+  }
+
+  // Loads the directory's slash commands (same location scoping as the
+  // model/agent selectors); failure just disables the feature quietly.
+  async loadCommands() {
+    if (!this.driverCapabilities().commands || !this.driver?.client) return;
+    const directory = this.session?.location?.directory || this.draftDirectory;
+    try {
+      this.commands = normalizeCommandList(await this.driver.client.commands(directory));
+    } catch {
+      this.commands = [];
+    }
+    if (!this.unsubscribed && this.cmdQuery !== null) this.renderCommandMenu();
+  }
+
+  // Show/hide the autocomplete menu from the current composer text.
+  updateCommandMenu() {
+    const raw =
+      this.readOnly || !this.commands.length ? null : composerCommandQuery(this.inputEl?.value || "");
+    if (raw !== this.cmdQuery) this.cmdIndex = 0;
+    this.cmdQuery = raw;
+    if (raw === null) {
+      this.closeCommandMenu();
+      return;
+    }
+    this.renderCommandMenu();
+  }
+
+  renderCommandMenu() {
+    if (!this.cmdMenuEl || this.cmdQuery === null) return;
+    const matches = filterCommands(this.commands, this.cmdQuery);
+    if (!matches.length) {
+      this.closeCommandMenu();
+      return;
+    }
+    this.cmdMenuEl.hidden = false;
+    this.cmdRows = matches.slice(0, 12);
+    this.cmdIndex = Math.min(Math.max(this.cmdIndex, 0), this.cmdRows.length - 1);
+    this.cmdListEl.empty();
+    this.cmdRows.forEach((command, index) => {
+      const row = this.cmdListEl.createDiv({ cls: "oc-cmdmenu-row" });
+      if (index === this.cmdIndex) row.addClass("is-selected");
+      row.createSpan({ cls: "oc-cmdmenu-name", text: `/${command.name}` });
+      if (command.description) row.createSpan({ cls: "oc-cmdmenu-desc", text: command.description });
+      // mousedown (not click) so the textarea never loses focus mid-press.
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        this.applyCommandSelection(command);
+      });
+    });
+  }
+
+  moveCommandSelection(delta) {
+    if (!this.cmdRows.length) return;
+    this.cmdIndex = (this.cmdIndex + delta + this.cmdRows.length) % this.cmdRows.length;
+    const rows = this.cmdListEl?.children || [];
+    for (let index = 0; index < rows.length; index += 1) {
+      rows[index].toggleClass("is-selected", index === this.cmdIndex);
+    }
+    rows[this.cmdIndex]?.scrollIntoView({ block: "nearest" });
+  }
+
+  applyCommandSelection(command) {
+    if (!this.inputEl || !command?.name) return;
+    this.inputEl.value = `/${command.name} `;
+    this.autoGrow();
+    this.closeCommandMenu();
+    this.updateComposer();
+    this.inputEl.focus();
+  }
+
+  closeCommandMenu() {
+    this.cmdQuery = null;
+    this.cmdRows = [];
+    this.cmdIndex = -1;
+    if (this.cmdMenuEl) this.cmdMenuEl.hidden = true;
   }
 
   setOffline(offline, reason = "") {
@@ -5891,6 +6244,7 @@ class SessionChatView extends ItemView {
       this.lastLoadedAt = Date.now();
       this.loadModels().catch(() => {});
       this.loadAgents().catch(() => {});
+      this.loadCommands().catch(() => {});
       this.refreshPendingPermission().catch(() => {});
       this.refreshPendingQuestion().catch(() => {});
     } catch (error) {
@@ -6145,6 +6499,13 @@ class SessionChatView extends ItemView {
     }
   }
 
+  // ----- session environment popup (spec/009) ---------------------------------
+
+  showEnvironment() {
+    if (!this.driver?.client) return;
+    new SessionEnvironmentModal(this.app, this.driver.client, this.session?.location?.directory || this.draftDirectory || null).open();
+  }
+
   // Header ⋮ menu: chat actions (Copy ID, Refresh) plus the shared
   // working-directory section. Drafts have no id yet — those entries stay
   // disabled until the first message creates the session.
@@ -6261,6 +6622,10 @@ class SessionChatView extends ItemView {
     this.order = [];
     this.cursorOlder = null;
     this.olderButton.style.display = "none";
+    // Replaced history is not "new" — a full reload must not light the
+    // jump button's unread badge (spec/009).
+    this.awayUnread = 0;
+    this.updateJumpButton();
   }
 
   // `cursorOlder` continues pagination toward older messages (cursor-only
@@ -6299,6 +6664,15 @@ class SessionChatView extends ItemView {
     record = { el, msg: message, json, parts: new Map(), streaming: false };
     this.messages.set(message.id, record);
     this.order.push(message.id);
+    // Arrived while the user is scrolled away (spec/009): bump the
+    // jump button's badge instead of yanking the viewport — streaming
+    // growth stays pinned to the bottom only when the user is there.
+    // (Older pages bypass this via renderOlderMessageEl; full reloads
+    // reset the counter in resetMessages.)
+    if (!this.chatAtBottom()) {
+      this.awayUnread += 1;
+      this.updateJumpButton();
+    }
     this.renderMessageBody(record);
     return record;
   }
@@ -7420,25 +7794,55 @@ class SessionChatView extends ItemView {
       await this.sendDraft(text);
       return;
     }
+    this.closeCommandMenu();
     this.inputEl.value = "";
     this.autoGrow();
     this.updateComposer();
+    // The composer is fixed to the viewport bottom — a sent message must be
+    // visible immediately, wherever the transcript was scrolled (spec/009).
+    this.jumpToBottom(true);
     try {
-      const response = await this.driver.client.prompt(this.sessionId, text);
-      const user = response?.data;
-      this.upsertMessage({
-        id: user?.id || `local-${Date.now()}`,
-        type: "user",
-        time: { created: user?.time?.created || Date.now() },
-        text: user?.payload?.text || text,
-      });
-      this.setBusy(true);
+      await this.deliverText(this.sessionId, text);
     } catch (error) {
       new Notice(`Send failed: ${error.message}`);
       this.inputEl.value = text;
       this.autoGrow();
     }
     this.updateComposer();
+  }
+
+  // Sends already-validated text to an existing session. Routes a leading
+  // "/command" through the command endpoint when the name matches a loaded
+  // server command (the TUI's rule — unknown /names stay plain prompts);
+  // everything else goes through the prompt API.
+  async deliverText(sessionId, text) {
+    const parsed = parseComposerCommand(text);
+    const known = parsed ? this.commands.some((command) => command?.name === parsed.name) : false;
+    const response = known
+      ? await this.driver.client.runCommand(sessionId, parsed.name, parsed.args)
+      : await this.driver.client.prompt(sessionId, text);
+    const user = response?.data;
+    if (user?.id) {
+      this.upsertMessage({
+        id: user.id,
+        type: "user",
+        time: { created: user.time?.created || Date.now() },
+        text: user.payload?.text || text,
+      });
+    } else if (known) {
+      // Released v2 answers the command endpoint 204/no-body: no synthetic
+      // bubble — the real message arrives via session.inbox.enqueued (or
+      // this reconcile, if the event was missed).
+      this.scheduleReconcile();
+    } else {
+      this.upsertMessage({
+        id: `local-${Date.now()}`,
+        type: "user",
+        time: { created: Date.now() },
+        text,
+      });
+    }
+    this.setBusy(true);
   }
 
   // Drafts create the server session lazily with the first message, so no
@@ -7480,17 +7884,11 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       // The server resolved the default agent at creation — show it.
       this.selectAgentId(session.agent || "");
+      this.closeCommandMenu();
       this.inputEl.value = "";
       this.autoGrow();
-      const response = await this.driver.client.prompt(session.id, text);
-      const user = response?.data;
-      this.upsertMessage({
-        id: user?.id || `local-${Date.now()}`,
-        type: "user",
-        time: { created: user?.time?.created || Date.now() },
-        text: user?.payload?.text || text,
-      });
-      this.setBusy(true);
+      this.jumpToBottom(true);
+      await this.deliverText(session.id, text);
     } catch (error) {
       new Notice(`Could not create session: ${error.message}`);
     }
@@ -7943,6 +8341,139 @@ class SnippetConfigModal extends Modal {
       summary.setText("Applied — config now matches the snippet.");
     }
     this.renderPostInstallButtons();
+  }
+}
+
+// Session environment popup (spec/009): what the server exposes for the
+// session's directory — MCP servers with statuses (+ connect/disconnect),
+// slash commands, and skills. Sections degrade independently; every action
+// re-fetches the picture.
+class SessionEnvironmentModal extends Modal {
+  constructor(app, client, directory) {
+    super(app);
+    this.client = client;
+    this.directory = directory || null;
+    this.mcp = [];
+    this.commands = [];
+    this.skills = [];
+    this.loadFailed = false;
+  }
+
+  onOpen() {
+    this.contentEl.empty();
+    this.contentEl.addClass("oc-env");
+    this.titleEl.setText("Session environment");
+    const sub = this.contentEl.createDiv({ cls: "oc-env-sub" });
+    const subText = sub.createDiv({ cls: "oc-env-sub-text" });
+    subText.setText(
+      this.directory
+        ? `What the server provides for ${displayDirectory(this.directory, null)} — MCP servers, slash commands, skills.`
+        : "What the server provides — MCP servers, slash commands, skills.",
+    );
+    const refresh = sub.createEl("button", {
+      cls: "oc-env-refresh",
+      text: "Refresh",
+      attr: { "aria-label": "Refresh", title: "Re-fetch MCP servers, commands, skills" },
+    });
+    refresh.addEventListener("click", () => this.load());
+    this.bodyEl = this.contentEl.createDiv({ cls: "oc-env-body" });
+    this.bodyEl.createDiv({ cls: "oc-env-loading", text: "Loading…" });
+    this.load();
+  }
+
+  async load() {
+    const [mcp, commands, skills] = await Promise.all([
+      this.client.mcpList(this.directory).catch(() => null),
+      this.client.commands(this.directory).catch(() => null),
+      this.client.skillList(this.directory).catch(() => null),
+    ]);
+    // Distinguish "nothing configured" from "nothing fetched": sections
+    // degrade independently, but a total failure is a server problem.
+    this.loadFailed = mcp === null && commands === null && skills === null;
+    this.mcp = mcp ? normalizeMcpList(mcp) : [];
+    this.commands = commands ? normalizeCommandList(commands) : [];
+    this.skills = skills ? normalizeSkillList(skills) : [];
+    if (!this.bodyEl) return; // closed while fetching
+    this.renderBody();
+  }
+
+  renderBody() {
+    this.bodyEl.empty();
+    if (this.loadFailed) {
+      this.bodyEl.createDiv({ cls: "oc-env-empty", text: "Server unreachable — could not fetch anything. Try Refresh." });
+      return;
+    }
+    this.renderMcpSection();
+    this.renderListSection("Slash commands", this.commands, "Type /name in the composer to run one.");
+    this.renderListSection("Skills", this.skills, "");
+    if (!this.mcp.length && !this.commands.length && !this.skills.length) {
+      this.bodyEl.createDiv({ cls: "oc-env-empty", text: "Nothing configured for this directory." });
+    }
+  }
+
+  renderMcpSection() {
+    const section = this.bodyEl.createDiv({ cls: "oc-env-group" });
+    const head = section.createDiv({ cls: "oc-env-group-head" });
+    head.createSpan({ cls: "oc-env-group-title", text: "MCP servers" });
+    const connected = this.mcp.filter((server) => server.status === "connected").length;
+    head.createSpan({ cls: "oc-env-group-count", text: `${connected} connected · ${this.mcp.length} total` });
+    if (!this.mcp.length) {
+      section.createDiv({ cls: "oc-env-empty", text: "No MCP servers configured for this directory." });
+      return;
+    }
+    for (const server of this.mcp) {
+      const row = section.createDiv({ cls: "oc-env-row" });
+      const main = row.createDiv({ cls: "oc-env-row-main" });
+      main.createSpan({ cls: "oc-env-name", text: server.name });
+      const meta = MCP_STATUS_META[server.status] || { label: server.status, cls: "unknown" };
+      main.createSpan({ cls: `oc-env-status oc-env-status-${meta.cls}`, text: meta.label });
+      if (server.error) row.createDiv({ cls: "oc-env-error", text: server.error });
+      const action = row.createEl("button", {
+        cls: "oc-env-action",
+        text: server.status === "connected" ? "Disconnect" : "Connect",
+      });
+      action.addEventListener("click", () => this.runMcpAction(server, action));
+    }
+  }
+
+  renderListSection(title, items, hint) {
+    const section = this.bodyEl.createDiv({ cls: "oc-env-group" });
+    const head = section.createDiv({ cls: "oc-env-group-head" });
+    head.createSpan({ cls: "oc-env-group-title", text: title });
+    head.createSpan({ cls: "oc-env-group-count", text: String(items.length) });
+    if (hint) section.createDiv({ cls: "oc-env-hint", text: hint });
+    if (!items.length) {
+      section.createDiv({ cls: "oc-env-empty", text: "None." });
+      return;
+    }
+    for (const item of items.slice(0, 50)) {
+      const row = section.createDiv({ cls: "oc-env-row oc-env-row-plain" });
+      row.createSpan({ cls: "oc-env-name", text: item.name });
+      if (item.description) row.createSpan({ cls: "oc-env-item-desc", text: item.description });
+    }
+    if (items.length > 50) {
+      section.createDiv({ cls: "oc-env-empty", text: `… and ${items.length - 50} more` });
+    }
+  }
+
+  async runMcpAction(server, button) {
+    const action = server.status === "connected" ? "disconnect" : "connect";
+    button.disabled = true;
+    button.setText("…");
+    try {
+      const response = await this.client.mcpServerAction(server.name, action);
+      const result = isPlainObject(response?.data) ? response.data : isPlainObject(response) ? response : {};
+      if (result.authorizationUrl) {
+        new Notice(`${server.name}: authorization required — opening the authorization page`);
+        if (typeof window !== "undefined" && window.open) window.open(String(result.authorizationUrl), "_blank");
+      } else {
+        new Notice(`${server.name}: ${action === "connect" ? "connect requested" : "disconnected"}`);
+      }
+    } catch (error) {
+      new Notice(`${server.name}: ${error.message}`);
+    }
+    // Re-fetch: statuses changed (and the row rebuild re-enables buttons).
+    await this.load();
   }
 }
 
