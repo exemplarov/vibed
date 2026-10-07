@@ -15,9 +15,9 @@ const obsidianLine = src.split("\n").find((l) => l.includes('require("obsidian")
 if (!obsidianLine) throw new Error("obsidian require not found in main.js");
 src = src.replace(
   obsidianLine,
-  `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {} } = {};`,
+  `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class {}, TFile = class {}, TFolder = class {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
@@ -37,6 +37,10 @@ const {
   splitDirGlobs,
   directoryInSubtree,
   directoryMatchesFilter,
+  composeVibedBlock,
+  applyAgentReference,
+  analyzeVibedLine,
+  normalizeTagList,
 } = require(tmp);
 
 function makeEl(tag, opts = {}) {
@@ -403,6 +407,74 @@ const check = (name, fn) => {
     if (merged.list.length !== 1 || merged.list[0] !== 3) throw new Error("arrays must replace");
     if (!deepEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })) throw new Error("equal rejected");
     if (deepEqual({ a: 1 }, { a: 2 })) throw new Error("unequal accepted");
+  });
+
+  check("composeVibedBlock emits minimal, ordered, parseable blocks", () => {
+    const body = composeVibedBlock({
+      connector: "claude",
+      basedir: "~/spaces",
+      dirs: ["kangram", "kangram", ""],
+      tags: "urgent, ops,urgent",
+      sessions: [],
+      layout: "table",
+      pageSize: 20,
+      title: "Ops",
+    });
+    const expected = [
+      "connector: claude",
+      "basedir: ~/spaces",
+      "dirs:",
+      "  - kangram",
+      "tags:",
+      "  - urgent",
+      "  - ops",
+      "layout: table",
+      "pageSize: 20",
+      "title: Ops",
+    ].join("\n");
+    if (body !== expected) throw new Error(`composed block wrong:\n${body}`);
+    // Round-trip: composed output must parse back to the same values.
+    const parsed = parseBlockConfig(body);
+    if (parsed.connector !== "claude" || parsed.layout !== "table") throw new Error("round-trip parse failed");
+    if (JSON.stringify(parsed.dirs) !== JSON.stringify(["kangram"])) throw new Error("dirs round-trip failed");
+    if (JSON.stringify(parsed.tags) !== JSON.stringify(["urgent", "ops"])) throw new Error("tags round-trip failed");
+    // Defaults are omitted, comments survive.
+    const minimal = composeVibedBlock({ layout: "cards", comment: "active filter: is:running" });
+    if (minimal !== "# active filter: is:running") throw new Error(`minimal block wrong: ${minimal}`);
+  });
+
+  check("analyzeVibedLine classifies key, value, and list positions", () => {
+    const keyPos = analyzeVibedLine("conn", 4);
+    if (keyPos.kind !== "key" || keyPos.query !== "conn" || keyPos.start !== 0) throw new Error("key position wrong");
+    const valuePos = analyzeVibedLine("connector: cla", 14);
+    if (valuePos.kind !== "value" || valuePos.key !== "connector" || valuePos.query !== "cla") {
+      throw new Error("value position wrong");
+    }
+    if (valuePos.start !== 11) throw new Error(`value replacement start wrong: ${valuePos.start}`);
+    const emptyValue = analyzeVibedLine("connector: ", 11);
+    if (emptyValue.kind !== "value" || emptyValue.query !== "") throw new Error("empty value position wrong");
+    const listPos = analyzeVibedLine("  - ~/spa", 9);
+    if (listPos.kind !== "list" || listPos.query !== "~/spa" || listPos.start !== 4) throw new Error("list position wrong");
+    const midWord = analyzeVibedLine("layout: table", 11);
+    if (midWord.kind !== "value" || midWord.query !== "tab") throw new Error("mid-word query wrong");
+  });
+
+  check("applyAgentReference is idempotent and non-destructive", () => {
+    const section = "<!-- vibed:begin -->\nreference body\n<!-- vibed:end -->";
+    const fresh = applyAgentReference("", section);
+    if (!fresh.includes(section) || !fresh.endsWith("\n")) throw new Error("fresh file wrong");
+    const appended = applyAgentReference("# My rules\n", section);
+    if (!appended.startsWith("# My rules\n\n")) throw new Error("append must keep user content first");
+    const updated = applyAgentReference(appended, "<!-- vibed:begin -->\nnew body\n<!-- vibed:end -->");
+    if (updated.includes("reference body") || !updated.includes("new body")) throw new Error("marker replace failed");
+    if (!updated.startsWith("# My rules\n\n")) throw new Error("update must not touch user content");
+    if (!updated.includes("new body") || updated.includes("reference body")) throw new Error("re-apply must replace, not stack");
+  });
+
+  check("normalizeTagList accepts arrays and comma strings", () => {
+    if (JSON.stringify(normalizeTagList(["a", "b", "a"])) !== JSON.stringify(["a", "b"])) throw new Error("array input wrong");
+    if (JSON.stringify(normalizeTagList("a, b ,a")) !== JSON.stringify(["a", "b"])) throw new Error("string input wrong");
+    if (normalizeTagList("").length) throw new Error("empty input must yield empty list");
   });
 
   fs.unlinkSync(tmp);

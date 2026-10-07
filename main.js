@@ -1,4 +1,4 @@
-const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Menu, Modal, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
+const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Menu, Modal, Notice, PluginSettingTab, Setting, setIcon, EditorSuggest, FuzzySuggestModal, TFile, TFolder } = require("obsidian");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -798,6 +798,176 @@ function parseBlockConfig(source) {
     }
   }
   return config;
+}
+
+// ---------------------------------------------------------------------------
+// Block authoring (spec/008). Everything here is pure so the smoke test can
+// exercise it outside Obsidian: key metadata (autocomplete popup), block
+// composition (insert modal + copy-as-block), and cursor-line analysis (the
+// EditorSuggest trigger).
+// ---------------------------------------------------------------------------
+
+// Every key a vibed block understands, with the one-line description the
+// autocomplete popup shows. Ordered: dashboard options, then ephemeral
+// session-config keys, then root-state session-config keys.
+const VIBED_BLOCK_KEYS = [
+  { key: "connector", detail: "Connector name (e.g. claude, codex-2); omit for the default" },
+  { key: "dirs", detail: "Directories to list (list); `~` expands, trailing `/*` = whole subtree" },
+  { key: "basedir", detail: "Prefix for relative dirs; cards show paths relative to it" },
+  { key: "sessions", detail: "Explicit session ids (list) — renders a clean pinned widget" },
+  { key: "tags", detail: "Only sessions whose note carries all of these tags" },
+  { key: "layout", detail: "cards (default) or table" },
+  { key: "pageSize", detail: "Sessions per page (number)" },
+  { key: "title", detail: "Optional heading above the dashboard" },
+  { key: "model", detail: "Session config: provider/model[#variant] prefilled on new sessions" },
+  { key: "agent", detail: "Session config: agent used by sessions started from this block" },
+  { key: "permissions", detail: "Session config: permission rules (JSON), applied at session create" },
+  { key: "environment", detail: "Session config: env vars (JSON), applied at session create" },
+  { key: "skills", detail: "Session config: skill sources / {id, install} entries (list)" },
+  { key: "mcp", detail: "Session config: desired MCP servers (JSON)" },
+  { key: "commands", detail: "Session config: desired commands (JSON)" },
+  { key: "agents", detail: "Session config: desired subagents (JSON)" },
+  { key: "providers", detail: "Session config: desired providers (JSON)" },
+  { key: "references", detail: "Session config: docs injected into new sessions (list)" },
+  { key: "default_agent", detail: "Session config: default agent for the working directory" },
+];
+
+// `tags:` values arrive as arrays or comma strings — one normalized shape.
+function normalizeTagList(value) {
+  const source = Array.isArray(value) ? value : String(value || "").split(",");
+  return [...new Set(source.map((tag) => String(tag || "").trim()).filter(Boolean))];
+}
+
+// Composes a vibed block body (simple `key: value` format) from a config
+// object. Only keys with content are emitted — blocks stay minimal; lists
+// become `key:` + indented `- item` lines. `extraLines` are appended
+// verbatim (the insert modal's escape hatch for keys without a field).
+// `comment` becomes a `# …` line, skipped by the parser — copy-as-block uses
+// it to preserve filter criteria the block DSL cannot express.
+function composeVibedBlock(config = {}) {
+  const lines = [];
+  const scalar = (key, value) => {
+    const text = String(value ?? "").trim();
+    if (text) lines.push(`${key}: ${text}`);
+  };
+  const list = (key, items) => {
+    const clean = [...new Set((items || []).map((item) => String(item || "").trim()).filter(Boolean))];
+    if (!clean.length) return;
+    lines.push(`${key}:`);
+    for (const item of clean) lines.push(`  - ${item}`);
+  };
+  scalar("connector", config.connector);
+  scalar("basedir", config.basedir);
+  list("dirs", config.dirs);
+  list("tags", normalizeTagList(config.tags));
+  list("sessions", config.sessions);
+  if (String(config.layout || "").trim().toLowerCase() === "table") scalar("layout", "table");
+  const pageSize = Number(config.pageSize);
+  if (Number.isFinite(pageSize) && pageSize > 0) scalar("pageSize", pageSize);
+  scalar("title", config.title);
+  scalar("model", config.model);
+  scalar("agent", config.agent);
+  for (const line of Array.isArray(config.extraLines) ? config.extraLines : [config.extraLines]) {
+    const text = String(line || "").trimEnd();
+    if (text.trim()) lines.push(text);
+  }
+  if (config.comment) lines.push(`# ${String(config.comment).trim()}`);
+  return lines.join("\n");
+}
+
+// Cursor-line analysis for editor autocomplete: given the line text and
+// cursor column, classifies the position as a key name (`conn|`), a key
+// value (`connector: cl|`), or a list item (`- ~/spa|` under a `key:` owner
+// line). Returns the replacement range for a suggestion plus a partial
+// query, or null when there is nothing sensible to complete.
+function analyzeVibedLine(line, ch) {
+  const text = String(line || "");
+  const before = text.slice(0, ch);
+  const listMatch = /^(\s*-\s?)/.exec(before);
+  if (listMatch) {
+    const start = listMatch[1].length;
+    return { kind: "list", key: null, start, end: ch, query: before.slice(start).trim() };
+  }
+  const valueMatch = /^\s*([\w-]+)\s*:(.*)$/.exec(before);
+  if (valueMatch) {
+    const value = valueMatch[2];
+    const trimmed = value.replace(/^\s+/, "");
+    return {
+      kind: "value",
+      key: valueMatch[1],
+      start: ch - trimmed.length,
+      end: ch,
+      query: trimmed.trim(),
+    };
+  }
+  const wordStart = before.search(/[\w-]+$/);
+  const start = wordStart === -1 ? ch : wordStart;
+  return { kind: "key", key: null, start, end: ch, query: before.slice(start) };
+}
+
+// ---------------------------------------------------------------------------
+// Agent reference (spec/008). The canonical vibed-block cheatsheet ships
+// inside the plugin; the "Save AI agent reference" command writes or updates
+// it in any vault folder, so individual vaults never hand-maintain a copy.
+// Keep in sync with AGENTS.md in the repo when the block DSL changes.
+// ---------------------------------------------------------------------------
+
+const AGENT_REFERENCE_BEGIN = "<!-- vibed:begin";
+const AGENT_REFERENCE_END = "<!-- vibed:end -->";
+const AGENT_REFERENCE_VERSION_TOKEN = "__VERSION__";
+
+const AGENT_REFERENCE_MD = `## Vibed — agent reference
+
+_Vibed ${AGENT_REFERENCE_VERSION_TOKEN} (Obsidian plugin)._ This vault renders agent-session dashboards through fenced \`vibed\` code blocks. When editing notes here you can create or edit these blocks; the syntax follows. A block body is simple \`key: value\` lines (lists as indented \`- item\` lines) or one JSON object; \`#\` lines are comments.
+
+Directory dashboard — one card per session, click to open the live chat:
+
+\`\`\`vibed
+connector: opencode
+dirs:
+  - ~/spaces/my-project
+\`\`\`
+
+Pinned session — with only \`sessions:\` the block renders a clean widget (no toolbar):
+
+\`\`\`vibed
+sessions:
+  - ses_abc123def456
+\`\`\`
+
+Session-configuring block — \`model\`/\`agent\` prefill new sessions; the rest declares the desired OpenCode config of the working directory, diffed at session start (the user consents to installs):
+
+\`\`\`vibed
+model: zai/glm-5.3
+agent: build
+mcp: {"kangram": {"type": "remote", "url": "https://example.com/mcp"}}
+skills:
+  - ./skills/analysis
+\`\`\`
+
+**Options:** \`connector\` (name), \`dirs\` (list; \`~\` expands locally, a trailing \`/*\` matches the whole subtree), \`basedir\` (prefix for relative \`dirs\`), \`sessions\` (id list), \`tags\` (list — only sessions whose note carries all of them), \`layout\` (\`cards\`|\`table\`), \`pageSize\`, \`title\`.
+
+**Session-config keys:** \`model\` (\`provider/model[#variant]\`), \`agent\`, \`permissions\`, \`environment\` (ephemeral — prefill/create-time only, never written to disk); \`skills\`, \`mcp\`, \`commands\`, \`agents\`, \`providers\`, \`references\`, \`default_agent\` (desired directory config, installed on consent). Never put secrets in blocks — use OpenCode's \`{env:VAR}\` substitution.
+
+**Related facts:**
+
+- Session notes are ordinary vault files attached by \`session: <id>\` frontmatter (plus optional \`connector:\`); the notes folder defaults to \`vibed-notes/\`. Tags on a note are the session's tags.
+- Markdown links open chats: \`[label](obsidian://vibed?sessionId=ses_…)\` — add \`&connector=<name>\` for non-default connectors.
+- Inside Obsidian, \`Vibed: Insert session dashboard block\` builds a block via a form, and autocomplete works inside every \`vibed\` fence.`;
+
+// Merges a reference section (markers included) into an existing AGENTS.md:
+// replaces the previous managed section when markers exist, appends when the
+// file has content but no section, and creates a fresh file otherwise. The
+// user's own content outside the markers is never touched.
+function applyAgentReference(existing, section) {
+  const text = String(existing || "");
+  const beginIndex = text.indexOf(AGENT_REFERENCE_BEGIN);
+  const endIndex = text.indexOf(AGENT_REFERENCE_END);
+  if (beginIndex !== -1 && endIndex !== -1 && endIndex > beginIndex) {
+    return text.slice(0, beginIndex) + section + text.slice(endIndex + AGENT_REFERENCE_END.length);
+  }
+  if (!text.trim()) return `${section}\n`;
+  return `${text.replace(/\s+$/, "")}\n\n${section}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3938,6 +4108,38 @@ class SessionsDashboard {
     return String(this.options.layout || "cards").toLowerCase() === "table" ? "table" : "cards";
   }
 
+  // Serializes this dashboard (block options + current filter) back into a
+  // vibed block body. Filter criteria the DSL can't express (is:/dir:/model:
+  // and free text) ride along as a `# filter:` comment — the parser skips
+  // `#` lines, so the pasted block still renders the unfiltered view while
+  // the comment documents what the user had dialed in.
+  copyAsBlock() {
+    const filter = this.filterQuery || { tags: [], states: [], dirs: [], models: [], phrases: [] };
+    const tags = [...new Set([...normalizeTagList(this.options.tags), ...filter.tags])];
+    const hasCommentOnlyFilter =
+      filter.states.length || filter.dirs.length || filter.models.length || filter.phrases.length;
+    const defaultName = this.plugin.registry.defaultConnector()?.connector.name;
+    const connectorName =
+      this.requestedConnectorName ||
+      (this.connectorEntry?.connector.name && this.connectorEntry.connector.name !== defaultName
+        ? this.connectorEntry.connector.name
+        : "");
+    const body = composeVibedBlock({
+      connector: connectorName,
+      basedir: this.options.basedir,
+      dirs: this.options.dirs,
+      tags,
+      layout: this.layout(),
+      pageSize: this.options.pageSize,
+      title: this.options.showSettings ? "" : this.options.title,
+      comment: hasCommentOnlyFilter && this.filterInput ? `active filter: ${this.filterInput.value}` : "",
+    });
+    copyTextToClipboard(
+      `\`\`\`vibed\n${body}\n\`\`\``,
+      "vibed block copied — paste it into any note",
+    );
+  }
+
   // Explicit `sessions:` ids listed in the block (deduped, order preserved).
   pinnedSessionIds() {
     const raw = this.options.sessions;
@@ -3986,6 +4188,15 @@ class SessionsDashboard {
       });
       setIcon(filterMenuButton, "list-filter");
       filterMenuButton.addEventListener("click", () => this.toggleFilterMenu());
+      // Copy the block's own config plus the active filter back as a vibed
+      // block — the round-trip direction of authoring: filter here, paste
+      // the snippet anywhere.
+      const copyBlockButton = filterTools.createEl("button", {
+        cls: "opencode-sessions-filter-menu-button",
+        attr: { "aria-label": "Copy as vibed block", title: "Copy as vibed block" },
+      });
+      setIcon(copyBlockButton, "copy");
+      copyBlockButton.addEventListener("click", () => this.copyAsBlock());
       const refreshButton = toolbar.createEl("button", { text: "Refresh" });
       refreshButton.addEventListener("click", () => this.load());
       // New sessions need a drafts-capable connector (OpenCode v2) — the
@@ -8250,6 +8461,294 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
 }
 
 // ---------------------------------------------------------------------------
+// Block authoring UI (spec/008): editor autocomplete inside vibed fences,
+// the insert modal, and the agent-reference folder picker.
+// ---------------------------------------------------------------------------
+
+// Autocomplete inside ```vibed fences: key names with inline docs, and live
+// values where they exist — connector names from settings, layout values,
+// and the connector's configured directories under `dirs:` list items.
+class VibedBlockSuggest extends EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+  }
+
+  // Fires on every cursor/keystroke; returning null keeps the popup closed.
+  // The cursor must sit inside a ```vibed fence (nearest fence line above
+  // the cursor is its opener, and not the fence line itself).
+  onTrigger(cursor, editor, file) {
+    let fenceLine = null;
+    for (let i = cursor.line; i >= 0; i -= 1) {
+      const line = editor.getLine(i).trim();
+      if (!line.startsWith("```")) continue;
+      if (/^```\s*vibed\b/i.test(line)) fenceLine = i;
+      break; // the nearest fence line decides — opener means inside
+    }
+    if (fenceLine === null || fenceLine === cursor.line) return null;
+    const analysis = analyzeVibedLine(editor.getLine(cursor.line), cursor.ch);
+    if (!analysis) return null;
+    // Fence body lines: connector name + the list-owner key for items.
+    const blockLines = [];
+    for (let i = fenceLine + 1; i < editor.lineCount(); i += 1) {
+      const line = editor.getLine(i);
+      if (line.trim().startsWith("```")) break;
+      blockLines.push(line);
+    }
+    let connectorName = null;
+    for (const line of blockLines) {
+      const match = /^\s*connector:\s*(\S+)/.exec(line);
+      if (match) {
+        connectorName = match[1];
+        break;
+      }
+    }
+    if (analysis.kind === "list") {
+      for (let i = cursor.line - 1; i > fenceLine; i -= 1) {
+        const owner = /^([\w-]+):\s*$/.exec(editor.getLine(i).trim());
+        if (owner) {
+          analysis.key = owner[1];
+          break;
+        }
+      }
+    }
+    return {
+      editor,
+      file,
+      start: { line: cursor.line, ch: analysis.start },
+      end: { line: cursor.line, ch: analysis.end },
+      query: analysis.query,
+      kind: analysis.kind,
+      key: analysis.key,
+      connectorName,
+    };
+  }
+
+  getSuggestions(context) {
+    const query = String(context.query || "").toLowerCase();
+    const items = [];
+    const push = (label, detail, insert) => {
+      if (!query || label.toLowerCase().includes(query)) items.push({ label, detail, insert });
+    };
+    if (context.kind === "key") {
+      for (const entry of VIBED_BLOCK_KEYS) {
+        if (!query || entry.key.toLowerCase().startsWith(query)) {
+          items.push({ label: `${entry.key}:`, detail: entry.detail, insert: `${entry.key}: ` });
+        }
+      }
+      return items;
+    }
+    if (context.kind === "value" && context.key === "connector") {
+      for (const { connector } of this.plugin.registry.enabled()) {
+        push(connector.name, `${connector.kind} connector`, connector.name);
+      }
+      return items;
+    }
+    if (context.kind === "value" && context.key === "layout") {
+      push("cards", "one card per session (default)", "cards");
+      push("table", "compact table rows", "table");
+      return items;
+    }
+    if (context.kind === "list" && context.key === "dirs") {
+      const entry = context.connectorName
+        ? this.plugin.registry.byName(context.connectorName)
+        : this.plugin.registry.defaultConnector();
+      for (const directory of entry?.connector?.config?.directories || []) {
+        push(String(directory), "configured directory", String(directory));
+      }
+      return items;
+    }
+    return items;
+  }
+
+  renderSuggestion(item, el) {
+    el.createDiv({ text: item.label });
+    if (item.detail) el.createDiv({ cls: "vibed-suggest-detail", text: item.detail });
+  }
+
+  selectSuggestion(item) {
+    const context = this.context;
+    if (!context || !item) return;
+    context.editor.replaceRange(item.insert, context.start, context.end);
+  }
+}
+
+// "Insert session dashboard block": a form that composes the block and
+// inserts it at the cursor. A live preview shows the exact block text as
+// fields change — the fastest way to learn the syntax is to watch it.
+class VibedInsertModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.state = {
+      connector: "",
+      layout: "cards",
+      basedir: "",
+      dirs: "",
+      tags: "",
+      sessions: "",
+      pageSize: "",
+      title: "",
+      model: "",
+      agent: "",
+      extra: "",
+    };
+  }
+
+  onOpen() {
+    this.titleEl.setText("Insert session dashboard block");
+    const { contentEl } = this;
+    contentEl.addClass("vibed-insert-modal");
+
+    const connectors = this.plugin.registry.enabled();
+    const defaultName = this.plugin.registry.defaultConnector()?.connector.name || "";
+    const lineList = (text) => String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    this.renderPreview = () => {
+      const body = composeVibedBlock({
+        connector: this.state.connector === defaultName ? "" : this.state.connector,
+        basedir: this.state.basedir,
+        dirs: lineList(this.state.dirs),
+        tags: this.state.tags,
+        sessions: lineList(this.state.sessions),
+        layout: this.state.layout,
+        pageSize: this.state.pageSize,
+        title: this.state.title,
+        model: this.state.model,
+        agent: this.state.agent,
+        extraLines: lineList(this.state.extra),
+      });
+      this.blockText = `\`\`\`vibed\n${body}\n\`\`\``;
+      this.previewEl.setText(this.blockText);
+    };
+
+    const field = (name, label, placeholder) => {
+      new Setting(contentEl).setName(label).addText((text) => {
+        text.setPlaceholder(placeholder || "");
+        text.setValue(this.state[name]);
+        text.onChange((value) => {
+          this.state[name] = value;
+          this.renderPreview();
+        });
+      });
+    };
+
+    new Setting(contentEl).setName("Connector").addDropdown((dropdown) => {
+      dropdown.addOption("", `(default${defaultName ? `: ${defaultName}` : ""})`);
+      for (const { connector } of connectors) {
+        if (connector.name !== defaultName) dropdown.addOption(connector.name, connector.name);
+      }
+      dropdown.setValue(this.state.connector);
+      dropdown.onChange((value) => {
+        this.state.connector = value;
+        this.renderPreview();
+      });
+    });
+    new Setting(contentEl).setName("Layout").addDropdown((dropdown) => {
+      dropdown.addOption("cards", "cards (default)");
+      dropdown.addOption("table", "table");
+      dropdown.setValue(this.state.layout);
+      dropdown.onChange((value) => {
+        this.state.layout = value;
+        this.renderPreview();
+      });
+    });
+    field("basedir", "Base directory", "~/spaces");
+    this.textArea("dirs", "Directories", "one per line (relative to basedir, ~/…, or absolute; trailing /* for subtrees)");
+    this.textArea("tags", "Tags", "comma-separated — only sessions carrying all of them");
+    this.textArea("sessions", "Session IDs", "one per line — fills only `sessions:` for a clean pinned widget");
+    field("pageSize", "Page size", "");
+    field("title", "Title", "");
+
+    const advanced = contentEl.createEl("details", { cls: "vibed-insert-advanced" });
+    advanced.createEl("summary", { text: "Session config (advanced)" });
+    const advancedBody = advanced.createDiv();
+    const advancedField = (name, label, placeholder) => {
+      new Setting(advancedBody).setName(label).addText((text) => {
+        text.setPlaceholder(placeholder || "");
+        text.setValue(this.state[name]);
+        text.onChange((value) => {
+          this.state[name] = value;
+          this.renderPreview();
+        });
+      });
+    };
+    advancedField("model", "Model", "provider/model[#variant]");
+    advancedField("agent", "Agent", "build");
+    new Setting(advancedBody)
+      .setName("Extra config lines")
+      .setDesc("Raw `key: value` lines appended verbatim — permissions, environment, mcp, skills, …")
+      .addTextArea((area) => {
+        area.setValue(this.state.extra);
+        area.onChange((value) => {
+          this.state.extra = value;
+          this.renderPreview();
+        });
+      });
+
+    this.previewEl = contentEl.createEl("pre", { cls: "vibed-insert-preview" });
+    new Setting(contentEl).addButton((button) => {
+      button.setButtonText("Insert");
+      button.setCta();
+      button.onClick(() => this.insert());
+    });
+    this.renderPreview();
+  }
+
+  textArea(name, label, placeholder) {
+    new Setting(this.contentEl).setName(label).addTextArea((area) => {
+      area.setPlaceholder(placeholder || "");
+      area.setValue(this.state[name]);
+      area.onChange((value) => {
+        this.state[name] = value;
+        this.renderPreview();
+      });
+    });
+  }
+
+  insert() {
+    const editor = this.app.workspace.activeEditor?.editor;
+    if (!editor) {
+      new Notice("Open a markdown note first");
+      return;
+    }
+    const body = this.blockText || "";
+    const cursor = editor.getCursor();
+    const prefix = editor.getLine(cursor.line).slice(0, cursor.ch);
+    const text = `${prefix.trim() ? "\n" : ""}${body}\n`;
+    editor.replaceRange(text, cursor);
+    editor.setCursor({ line: cursor.line + text.split("\n").length - 1, ch: 0 });
+    this.close();
+  }
+}
+
+// Folder picker for the agent reference: vault root by default, any folder
+// on demand. "/" represents the root.
+class AgentReferenceFolderModal extends FuzzySuggestModal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.setPlaceholder("Save AGENTS.md where? (vault root by default)");
+  }
+
+  getItems() {
+    const folders = this.app.vault
+      .getAllLoadedFiles()
+      .filter((file) => file instanceof TFolder && file.path !== "/")
+      .sort((a, b) => a.path.localeCompare(b.path));
+    return ["/", ...folders];
+  }
+
+  getItemText(item) {
+    return item === "/" ? "/ (vault root)" : item.path;
+  }
+
+  onChooseItem(item) {
+    this.plugin.saveAgentReference(item === "/" ? "" : item.path);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -8429,6 +8928,19 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       id: "open-session-by-id",
       name: "Open session by ID",
       callback: () => this.promptForSessionId(),
+    });
+    // Block authoring (spec/008): autocomplete inside vibed fences, a form
+    // that inserts a new block, and the embedded agent reference.
+    this.registerEditorSuggest(new VibedBlockSuggest(this));
+    this.addCommand({
+      id: "insert-dashboard",
+      name: "Insert session dashboard block",
+      callback: () => new VibedInsertModal(this.app, this).open(),
+    });
+    this.addCommand({
+      id: "save-agent-reference",
+      name: "Save AI agent reference (AGENTS.md)",
+      callback: () => new AgentReferenceFolderModal(this.app, this).open(),
     });
     // Links from notes: [label](obsidian://vibed?sessionId=ses_…)
     // A `connector` parameter names the connector for non-default backends:
@@ -8877,6 +9389,33 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   openSettings() {
     this.app.setting.open();
     this.app.setting.openTabById(this.manifest.id);
+  }
+
+  // Writes/updates the embedded agent reference as an AGENTS.md section in
+  // the chosen folder. Markers make re-runs idempotent — everything outside
+  // them is the user's (or another tool's) content, untouched.
+  async saveAgentReference(folder = "") {
+    const referencePath = `${folder ? `${folder}/` : ""}AGENTS.md`;
+    const section = [
+      `${AGENT_REFERENCE_BEGIN} managed by the Vibed plugin — re-run "Save AI agent reference" to update (${this.manifest.version}) →`,
+      AGENT_REFERENCE_MD.replaceAll(AGENT_REFERENCE_VERSION_TOKEN, this.manifest.version),
+      AGENT_REFERENCE_END,
+    ].join("\n");
+    try {
+      const existingFile = this.app.vault.getAbstractFileByPath(referencePath);
+      if (existingFile instanceof TFile) {
+        const existing = await this.app.vault.read(existingFile);
+        await this.app.vault.modify(existingFile, applyAgentReference(existing, section));
+      } else if (existingFile) {
+        new Notice(`${referencePath} exists and is not a file`);
+        return;
+      } else {
+        await this.app.vault.create(referencePath, applyAgentReference("", section));
+      }
+      new Notice(`Agent reference saved to ${referencePath}`);
+    } catch (error) {
+      new Notice(`Could not save agent reference: ${error.message}`);
+    }
   }
 
   promptForSessionId() {

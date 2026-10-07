@@ -15,7 +15,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.17.1-blue)
+![version](https://img.shields.io/badge/version-0.18.0-blue)
 [![Obsidian community plugin](https://img.shields.io/badge/Obsidian-community%20plugin-7c3aed)](https://community.obsidian.md/plugins/vibed)
 
 ## Connectors
@@ -68,6 +68,8 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 ## Features
 
 - **Note-embedded dashboards** via a `vibed` code block (cards or table layout) — no other plugins required.
+- **Block authoring support**: a command palette form that inserts a new block (with live preview), autocomplete inside every `vibed` fence, and *Copy as vibed block* on dashboard toolbars. See [Authoring dashboards](#authoring-dashboards).
+- **Embedded agent reference**: one command writes/updates an AGENTS.md cheatsheet for AI sessions into any vault folder — vaults never hand-maintain their own copy.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).
 - **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Subsessions (task-tool subagents)**: subagent sessions never clutter the list — they nest under their parent's card. A parent waiting on running subagents gets a **Subagents running** state (derived — OpenCode reports parent and child both as plain "running"), and the card lists its subsessions: active ones by default, all via the expand toggle. Table layout nests the same strip in a sub-row. Opening a subsession chat shows a **subsession** chip in the header that links back to the main session.
@@ -102,6 +104,28 @@ allow, or reject without leaving the note:
 is created with your first message:
 
 ![New OpenCode session dialog with working-directory cards](images/new-session.png)
+
+## Authoring dashboards
+
+Three ways to never memorize the block syntax:
+
+- **Insert** — command palette: *Insert session dashboard block*. A form
+  (connector, layout, directories, tags, pinned session ids, page size,
+  title, advanced session-config fields) composes the block and inserts it
+  at the cursor. A live preview shows the exact block text as you type —
+  the fastest way to learn the keys is to watch them appear.
+- **Autocomplete** — inside every `vibed` fence: key names with one-line
+  docs, `connector:` names from your settings, `layout:` values, and
+  `- ` items under `dirs:` from the connector's configured directories.
+- **Copy as block** — the clipboard icon on any dashboard toolbar
+  serializes the block's config plus the active filter back into a `vibed`
+  block. Filter criteria the DSL can't express (`is:`, `dir:`, `model:`,
+  free text) ride along as a `# filter: …` comment.
+
+For AI sessions editing the vault, *Save AI agent reference (AGENTS.md)*
+writes or updates a managed `<!-- vibed:begin/end -->` section with the
+full block reference into any folder — re-runs replace only the managed
+section, never your own content.
 
 ## Embed in a note
 

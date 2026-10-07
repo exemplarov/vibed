@@ -1610,3 +1610,35 @@
   gap: 0.5rem;
   margin-top: 0.75rem;
 }
+
+/* Block authoring (spec/008) */
+
+.vibed-suggest-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.vibed-insert-modal textarea {
+  width: 100%;
+  min-height: 3.5rem;
+}
+
+.vibed-insert-advanced {
+  margin: 0.5rem 0;
+}
+
+.vibed-insert-advanced > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.vibed-insert-preview {
+  white-space: pre-wrap;
+  user-select: text;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 0.5rem 0.75rem;
+  font-size: var(--font-smaller);
+  margin: 0.5rem 0;
+}
