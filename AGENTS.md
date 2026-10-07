@@ -45,6 +45,14 @@ transcripts for OpenCode v1 / Claude Code / Codex / Cursor.
 3. `node --check main.js` + smoke test green.
 4. Commit message format: `~/spaces/loomp-os/wiki/commit-convention.md`
    (`<area>: <description>`).
+5. **Publish** — the Obsidian store tracks GitHub Releases, not commits:
+   `git push origin main`, then tag the release commit with the exact
+   manifest version (`git tag X.Y.Z && git push origin X.Y.Z`). The tag push
+   triggers `.github/workflows/release.yml`, which cuts the GitHub release
+   with `main.js`/`manifest.json`/`styles.css` as assets. Check `gh release
+   list` afterwards — the new version must be **Latest**, and the store
+   picks it up within ~an hour. An unpushed/unpublished commit is invisible
+   to users (this is how 0.18.0 briefly vanished: committed, never tagged).
 
 ## vibed block quick reference
 
