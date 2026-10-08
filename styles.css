@@ -148,8 +148,12 @@
 .opencode-sessions-cards-toolbar {
   display: flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.4rem;
   flex-wrap: wrap;
+  /* Reserve the top-right corner: Obsidian's block-edit button appears
+   * there on hover in live preview — the last toolbar control must never
+   * sit underneath it. */
+  padding-right: 1.9rem;
 }
 
 /* ----- advanced filter popover + tag chips ----- */
@@ -157,16 +161,19 @@
 .opencode-sessions-filter-tools {
   position: relative;
   display: inline-flex;
+  /* The filter and copy buttons are adjacent icon buttons — without a gap
+   * they read as one merged control. */
+  gap: 0.25rem;
 }
 
-.opencode-sessions-filter-menu-button {
+.opencode-sessions-tool-button {
   display: inline-flex;
   align-items: center;
   padding: 0.15rem 0.35rem;
 }
 
-.opencode-sessions-filter-menu-button.oc-active,
-.opencode-sessions-filter-menu-button:hover {
+.opencode-sessions-tool-button.oc-active,
+.opencode-sessions-tool-button:hover {
   color: var(--text-accent);
 }
 
@@ -177,13 +184,42 @@
   z-index: 20;
   min-width: 16rem;
   max-width: 24rem;
-  max-height: 22rem;
+  /* Internal scroll, capped by the visible pane: the popover stays fully
+   * reachable (and dismissable via its header ✕) even inside a short
+   * embed that would otherwise clip its top. */
+  max-height: min(22rem, 50vh);
   overflow-y: auto;
   padding: 0.6rem;
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   box-shadow: var(--shadow-s);
+}
+
+.opencode-sessions-filter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.45rem;
+}
+
+.opencode-sessions-filter-head-label {
+  font-size: var(--font-smallest);
+  font-weight: var(--font-bold);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.opencode-sessions-filter-close {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.2rem;
+  color: var(--text-faint);
+}
+
+.opencode-sessions-filter-close:hover {
+  color: var(--text-normal);
 }
 
 .opencode-sessions-filter-group {
@@ -214,7 +250,7 @@
   align-items: center;
   padding: 0.1rem 0.45rem;
   border-radius: 999px;
-  font-size: var(--font-smaller);
+  font-size: var(--font-smallest);
   border: 1px solid var(--background-modifier-border);
   background: var(--background-secondary);
   color: var(--text-muted);
@@ -264,6 +300,29 @@
 .opencode-sessions-cards-filter {
   flex-grow: 1;
   min-width: 12rem;
+  font-size: var(--font-smaller);
+}
+
+/* One-card-tall "nothing was found" placeholder (0.19.1): keeps a filtered-
+ * to-empty widget tall enough to keep using its own toolbar, and carries
+ * the clear-filter way out. */
+.opencode-sessions-empty {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 0.4rem;
+  min-height: 4.6rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px dashed var(--background-modifier-border-hover);
+  border-radius: var(--radius-m);
+  color: var(--text-faint);
+  font-size: var(--font-smaller);
+}
+
+.opencode-sessions-empty-clear {
+  align-self: flex-start;
+  font-size: var(--font-smaller);
 }
 
 .opencode-sessions-cards {

@@ -15,7 +15,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.19.0-blue)
+![version](https://img.shields.io/badge/version-0.19.1-blue)
 [![Obsidian community plugin](https://img.shields.io/badge/Obsidian-community%20plugin-7c3aed)](https://community.obsidian.md/plugins/vibed)
 
 ## Connectors
@@ -67,7 +67,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 
 ## Features
 
-- **Note-embedded dashboards** via a `vibed` code block (cards or table layout) — no other plugins required.
+- **Note-embedded dashboards** via a `vibed` code block (cards or table layout) — no other plugins required. Compact icon toolbar (filter, copy-as-block, refresh, new session) that keeps the top-right corner free for Obsidian's block-edit button; a filter that matches nothing leaves a one-card-tall empty state with a *Clear filter* escape hatch instead of collapsing the widget.
 - **Block authoring support**: a command palette form that inserts a new block (with live preview), autocomplete inside every `vibed` fence, and *Copy as vibed block* on dashboard toolbars. See [Authoring dashboards](#authoring-dashboards).
 - **Embedded agent reference**: one command writes/updates an AGENTS.md cheatsheet for AI sessions into any vault folder — vaults never hand-maintain their own copy.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).

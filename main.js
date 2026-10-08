@@ -4247,23 +4247,27 @@ class SessionsDashboard {
       // model, directory) that edits the same query string as the input.
       const filterTools = toolbar.createDiv({ cls: "opencode-sessions-filter-tools" });
       this.filterToolsEl = filterTools;
-      const filterMenuButton = filterTools.createEl("button", {
-        cls: "opencode-sessions-filter-menu-button",
-        attr: { "aria-label": "Advanced filters", title: "Advanced filters" },
-      });
-      setIcon(filterMenuButton, "list-filter");
-      filterMenuButton.addEventListener("click", () => this.toggleFilterMenu());
+      const toolButton = (parent, icon, label, title) => {
+        const button = parent.createEl("button", {
+          cls: "opencode-sessions-tool-button",
+          attr: { "aria-label": label, title: title || label },
+        });
+        setIcon(button, icon);
+        return button;
+      };
+      toolButton(filterTools, "list-filter", "Advanced filters").addEventListener("click", () =>
+        this.toggleFilterMenu(),
+      );
       // Copy the block's own config plus the active filter back as a vibed
       // block — the round-trip direction of authoring: filter here, paste
       // the snippet anywhere.
-      const copyBlockButton = filterTools.createEl("button", {
-        cls: "opencode-sessions-filter-menu-button",
-        attr: { "aria-label": "Copy as vibed block", title: "Copy as vibed block" },
-      });
-      setIcon(copyBlockButton, "copy");
-      copyBlockButton.addEventListener("click", () => this.copyAsBlock());
-      const refreshButton = toolbar.createEl("button", { text: "Refresh" });
-      refreshButton.addEventListener("click", () => this.load());
+      toolButton(filterTools, "copy", "Copy as vibed block").addEventListener("click", () =>
+        this.copyAsBlock(),
+      );
+      // Icon-only action buttons keep the toolbar compact in narrow embeds.
+      toolButton(toolbar, "rotate-cw", "Refresh", "Refresh sessions").addEventListener("click", () =>
+        this.load(),
+      );
       // New sessions need a drafts-capable connector (OpenCode v2) — the
       // dashboard's own connector, not whatever is globally default.
       let draftsCapable = false;
@@ -4275,8 +4279,7 @@ class SessionsDashboard {
         draftsCapable = false;
       }
       if (draftsCapable) {
-        const newButton = toolbar.createEl("button", { text: "New session" });
-        newButton.addEventListener("click", () => {
+        toolButton(toolbar, "plus", "New session", "Start a new session").addEventListener("click", () => {
           // Snippet config (spec/007): extracted per click so live edits to
           // the block apply without remounting the dashboard.
           let snippet = null;
@@ -4295,8 +4298,9 @@ class SessionsDashboard {
         });
       }
       if (this.options.showSettings) {
-        const settingsButton = toolbar.createEl("button", { text: "Settings" });
-        settingsButton.addEventListener("click", () => this.plugin.openSettings());
+        toolButton(toolbar, "settings", "Settings").addEventListener("click", () =>
+          this.plugin.openSettings(),
+        );
       }
     }
 
@@ -4569,7 +4573,9 @@ class SessionsDashboard {
       );
     }
     this.listEl.empty();
-    if (this.layout() === "table") {
+    if (!shown.length) {
+      this.renderEmptyState();
+    } else if (this.layout() === "table") {
       this.renderTable(shown);
     } else {
       this.renderCards(shown);
@@ -4584,6 +4590,50 @@ class SessionsDashboard {
       .writeText(sessionId)
       .then(() => new Notice(`Copied ${sessionId}`))
       .catch(() => new Notice(sessionId));
+  }
+
+  // Any criterion set in the active filter (phrases count too).
+  filterQueryActive() {
+    const query = this.filterQuery;
+    return !!(
+      (query?.phrases || []).length ||
+      (query?.tags || []).length ||
+      (query?.states || []).length ||
+      (query?.dirs || []).length ||
+      (query?.models || []).length
+    );
+  }
+
+  // Escape hatch for the "everything filtered away" trap: without it a
+  // filter that hides every session can shrink the embed until its own
+  // toolbar is too cramped to edit the filter back out of.
+  clearFilter() {
+    this.filterQuery = parseFilterQuery("");
+    if (this.filterInput) this.filterInput.value = "";
+    this.visible = this.basePageSize();
+    if (this.filterMenuEl) this.renderFilterMenu();
+    this.render();
+  }
+
+  // One-card-tall placeholder when nothing renders: keeps the widget
+  // usable (the toolbar stays above a visible body) and, when a filter is
+  // the cause, carries the way back out of it.
+  renderEmptyState() {
+    const el = this.listEl.createDiv({ cls: "opencode-sessions-empty" });
+    if (this.filterQueryActive()) {
+      el.createSpan({ text: "No sessions match the current filter." });
+      const clear = el.createEl("button", {
+        cls: "opencode-sessions-empty-clear",
+        text: "Clear filter",
+      });
+      clear.addEventListener("click", () => this.clearFilter());
+      return;
+    }
+    el.createSpan({
+      text: this.sessionsOnlyMode()
+        ? "No pinned sessions found — they may be deleted, or the connector is unreachable."
+        : "No sessions for the configured directories yet.",
+    });
   }
 
   // ----- subsession hierarchy ------------------------------------------------
@@ -4750,6 +4800,17 @@ class SessionsDashboard {
     const menu = this.filterMenuEl;
     if (!menu) return;
     menu.empty();
+
+    // Header with an explicit close: the popover scrolls internally, so it
+    // must stay dismissable even when taller than the surrounding embed.
+    const head = menu.createDiv({ cls: "opencode-sessions-filter-head" });
+    head.createDiv({ cls: "opencode-sessions-filter-head-label", text: "Filters" });
+    const closeButton = head.createEl("button", {
+      cls: "opencode-sessions-filter-close",
+      attr: { "aria-label": "Close filters", title: "Close (Esc)" },
+    });
+    setIcon(closeButton, "x");
+    closeButton.addEventListener("click", () => this.closeFilterMenu());
 
     const group = (label) => {
       const section = menu.createDiv({ cls: "opencode-sessions-filter-group" });
