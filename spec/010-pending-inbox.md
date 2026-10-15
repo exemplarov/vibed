@@ -67,6 +67,12 @@ chronologically once the item is a real message.
 - **Ctrl/Cmd+Enter** — send with `delivery: "queue"` (the TUI's
   `<leader>return`). Slash commands ignore queueing (the command endpoint
   does not take a delivery parameter).
+- **Queue button** — appears between Stop and Send *only while a turn is
+  running* (the one state where queue differs from steer — an idle session
+  picks either up immediately, so the button would be noise). Labeled
+  "Queue" + a symbol-only keys hint (⌘↵ on Apple platforms, ⌃↵ elsewhere)
+  that doubles as the shortcut reminder; hidden offline and in drafts,
+  disabled with an empty composer.
 - Composer placeholder and the hint line document both. The hint line also
   surfaces the pending count (`2 prompts pending — …`) while items wait.
 

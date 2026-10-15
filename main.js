@@ -1941,6 +1941,16 @@ function inboxMessageFrom(item) {
   return { id: item.id, type: item.type, time: { created: item.created }, text: item.text };
 }
 
+// Symbol-only "Mod+Enter" reminder for the Queue button (spec/010): ⌘↵ on
+// Apple platforms, ⌃↵ elsewhere — glyphs, not words, to stay compact.
+function modEnterHint() {
+  return /mac/i.test(navigator.platform || "") ? "⌘↵" : "⌃↵";
+}
+
+function modEnterLabel() {
+  return /mac/i.test(navigator.platform || "") ? "Cmd+Enter" : "Ctrl+Enter";
+}
+
 // ---------------------------------------------------------------------------
 // Live event stream (SSE) from GET /api/event. One shared connection for the
 // whole plugin; drives live session state (running/idle/…) and streaming
@@ -5737,6 +5747,9 @@ class SessionChatView extends ItemView {
       this.stopButton.style.display = "none";
       this.sendButton = actions.createEl("button", { cls: "oc-send", text: "Send" });
       this.sendButton.style.display = "none";
+      this.queueButton = actions.createEl("button", { cls: "oc-send oc-send-queue", text: "Queue" });
+      this.queueButton.createSpan({ cls: "oc-kbd", text: modEnterHint() });
+      this.queueButton.style.display = "none";
       this.updateComposer();
       return;
     }
@@ -5767,6 +5780,18 @@ class SessionChatView extends ItemView {
     this.hintEl = actions.createSpan({ cls: "oc-hint", text: "" });
     this.stopButton = actions.createEl("button", { cls: "oc-stop", text: "Stop" });
     this.stopButton.addEventListener("click", () => this.stop());
+    // Queue (spec/010): visible only while the session runs — the one
+    // state where queue (hold for idle) differs from steer (join the
+    // running turn). Doubles as the Mod+Enter reminder.
+    this.queueButton = actions.createEl("button", {
+      cls: "oc-send oc-send-queue",
+      text: "Queue",
+      attr: {
+        title: `Hold this prompt until the current turn finishes (${modEnterLabel()})`,
+      },
+    });
+    this.queueButton.createSpan({ cls: "oc-kbd", text: modEnterHint() });
+    this.queueButton.addEventListener("click", () => this.send("queue"));
     this.sendButton = actions.createEl("button", { cls: "oc-send", text: "Send" });
     this.sendButton.addEventListener("click", () => this.send());
 
@@ -5965,6 +5990,12 @@ class SessionChatView extends ItemView {
     this.sendButton.disabled = !!this.offline || !this.inputEl?.value?.trim();
     this.stopButton.disabled = !!this.offline || !this.busy;
     this.stopButton.style.display = "";
+    // Queue differs from plain Send only while a turn is running (an idle
+    // session picks either up immediately) — hide it the rest of the time
+    // so the composer stays compact (spec/010).
+    const queueUseful = this.busy && !this.offline && !this.isDraft();
+    this.queueButton.style.display = queueUseful ? "" : "none";
+    this.queueButton.disabled = !this.inputEl?.value?.trim();
     if (this.offline) {
       this.hintEl.setText("Offline — input disabled");
     } else if (this.pendingPermission) {

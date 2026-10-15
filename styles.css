@@ -1562,13 +1562,28 @@
   margin-left: auto;
 }
 
+/* Queue (spec/010): sits between Stop and Send while a turn runs; the
+ * symbol hint (⌘↵ / ⌃↵) reminds of the Mod+Enter shortcut. No auto
+ * margin — Send stays the right-anchored primary. */
+.oc-send-queue {
+  margin-left: 0;
+}
+
+.oc-kbd {
+  margin-left: 0.35rem;
+  font-size: var(--font-smallest);
+  font-family: var(--font-monospace);
+  opacity: 0.65;
+}
+
 .oc-send,
 .oc-stop {
   flex-shrink: 0;
 }
 
 .oc-stop:disabled,
-.oc-send:disabled {
+.oc-send:disabled,
+.oc-send-queue:disabled {
   opacity: 0.5;
 }
 
