@@ -15,7 +15,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.19.1-blue)
+![version](https://img.shields.io/badge/version-0.20.0-blue)
 [![Obsidian community plugin](https://img.shields.io/badge/Obsidian-community%20plugin-7c3aed)](https://community.obsidian.md/plugins/vibed)
 
 ## Connectors
@@ -78,7 +78,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Slash commands**: type `/` in the composer to get the TUI's command menu — filter by name, `↑`/`↓` to move, `Tab`/`Enter` to complete (an exact name sends right away). Commands run server-side via the command endpoint with arguments, multi-line included; unknown `/names` are sent as plain prompts, like the TUI.
 - **Session environment popup**: a header button shows what the server provides for the session's directory — MCP servers with live statuses (connect/disconnect inline, errors shown), slash commands, and skills. Same picture as the TUI sidebar, one Refresh away.
 - **Find in chat**: `Ctrl+F` / `Cmd+F` opens a browser-style find bar over the transcript — live match count, all-matches highlighting, `Enter`/`Shift+Enter` (also `F3`, `Cmd/Ctrl+G`) to navigate with wrap-around, `Aa` toggles case sensitivity, `Esc` closes and restores focus. Searches exactly what's on screen: collapsed Thinking / tool Input / Output sections are skipped until you expand them (expanding re-runs the search live), and streaming or newly paged-in messages refresh the results automatically.
-- **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
+- **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors). Sent-but-unprocessed prompts are highlighted (dashed bubble, "Queued"/"Sent" status) and pinned at the bottom of the transcript until the session picks them up — cancel one, recall it back into the composer, or flip it between *steer* (joins the running turn) and *queue* (waits for idle). `Ctrl/Cmd+Enter` sends directly to the queue; queued compactions show as cancellable rows too.
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message. Each directory card carries a **⋮ menu** with the working-directory actions — copy path, open in the file manager, open in a terminal — so you can inspect a candidate before picking it.
 - **Snippet session config**: a `vibed` block can configure the sessions it starts — `model`/`agent`/`permissions`/`environment` per session, plus `skills`, `mcp`, `commands`, `agents`, `providers`, `references` as the desired config of the working directory. Matching config starts silently; a diff opens a dialogue to install (config merge + skill installers) or proceed as-is. See [Snippet session config](#snippet-session-config).
 - **Chat header menu**: the chat's ⋮ button gathers *Copy ID* and *Refresh* plus the same working-directory actions for the session's own directory.

@@ -1790,11 +1790,38 @@ class OpenCodeClient {
     return this.cancelForm(sessionId, pending.id);
   }
 
-  prompt(sessionId, text) {
+  // `delivery` defaults to "steer" server-side (injected at the next step
+  // boundary, even mid-turn); "queue" holds the prompt until the session
+  // is idle. Only "queue" is sent explicitly so older v2 servers that
+  // reject unknown fields keep accepting plain prompts.
+  prompt(sessionId, text, delivery = "steer") {
+    const body = { text };
+    if (delivery === "queue") body.delivery = "queue";
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
-      body: { text },
+      body,
     });
+  }
+
+  // Pending-inbox management (spec/010): items admitted but not yet
+  // delivered. Cancel is idempotent (204 even for already-delivered ids);
+  // PATCH flips steer ⇄ queue.
+  inboxList(sessionId) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/inbox`);
+  }
+
+  inboxCancel(sessionId, inboxId) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/inbox/${encodeURIComponent(inboxId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  inboxUpdate(sessionId, inboxId, delivery) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/inbox/${encodeURIComponent(inboxId)}`,
+      { method: "PATCH", body: { delivery } },
+    );
   }
 
   commands(directory) {
@@ -1860,6 +1887,58 @@ class OpenCodeClient {
       method: "POST",
     });
   }
+}
+
+// Normalizes a v2 session-inbox item (GET /inbox row, prompt response, or
+// session.inbox.enqueued payload) into one shape (spec/010):
+// { id, type: "user"|"compaction"|"move"|"synthetic", text, files, agents,
+//   skills, delivery: "steer"|"queue", created }
+function normalizeInboxItem(raw) {
+  if (!raw?.id) return null;
+  const payload = isPlainObject(raw.payload) ? raw.payload : {};
+  const delivery = raw.delivery === "queue" ? "queue" : "steer";
+  const created = raw.time?.created || Date.now();
+  if (raw.type === "user") {
+    return {
+      id: raw.id,
+      type: "user",
+      text: payload.text || "",
+      files: payload.files,
+      agents: payload.agents,
+      skills: payload.skills,
+      delivery,
+      created,
+    };
+  }
+  if (raw.type === "compaction" || raw.type === "move" || raw.type === "synthetic") {
+    return {
+      id: raw.id,
+      type: raw.type,
+      text: payload.description || payload.text || "",
+      delivery,
+      created,
+    };
+  }
+  return null;
+}
+
+// Projects a pending inbox item into the message shape the transcript
+// renders: a user bubble for prompts, a note row for control items
+// (compaction/move/synthetic). The id is stable — on delivery the server
+// promotes the inbox row into a real message with the same id.
+function inboxMessageFrom(item) {
+  if (item.type === "user") {
+    return {
+      id: item.id,
+      type: "user",
+      time: { created: item.created },
+      text: item.text,
+      files: item.files,
+      agents: item.agents,
+      skills: item.skills,
+    };
+  }
+  return { id: item.id, type: item.type, time: { created: item.created }, text: item.text };
 }
 
 // ---------------------------------------------------------------------------
@@ -5264,6 +5343,11 @@ class SessionChatView extends ItemView {
     this.cmdRows = [];
     this.cmdIndex = -1;
     this.cmdQuery = null;
+    // Pending inbox (spec/010): admitted-but-undelivered items by inboxID
+    // (= future message id), plus endpoint support (null = unprobed,
+    // false = server without inbox API → legacy rendering).
+    this.inbox = new Map();
+    this.inboxSupported = null;
   }
 
   getViewType() {
@@ -5658,7 +5742,11 @@ class SessionChatView extends ItemView {
     }
     this.inputEl = composer.createEl("textarea", {
       cls: "oc-input",
-      attr: { placeholder: "Message this session… (Enter to send, Shift+Enter for newline)", rows: "1" },
+      attr: {
+        placeholder:
+          "Message this session… (Enter to send, Shift+Enter for newline, Ctrl/Cmd+Enter to queue)",
+        rows: "1",
+      },
     });
     this.inputEl.addEventListener("keydown", (event) => this.onComposerKeydown(event));
     this.inputEl.addEventListener("input", () => {
@@ -5730,6 +5818,15 @@ class SessionChatView extends ItemView {
         const exact = this.cmdRows.find((command) => command.name === this.cmdQuery) || null;
         if (exact) this.send();
         else this.applyCommandSelection(this.cmdRows[Math.max(this.cmdIndex, 0)]);
+        return;
+      }
+      // Mod+Enter queues instead of steering (spec/010, the TUI's
+      // <leader>return): the prompt waits for the current turn to finish.
+      // With the menu open this branch is unreachable — commands cannot
+      // be queued server-side.
+      if (event.metaKey || event.ctrlKey) {
+        event.preventDefault();
+        this.send("queue");
         return;
       }
       event.preventDefault();
@@ -5863,6 +5960,8 @@ class SessionChatView extends ItemView {
       return;
     }
     const connected = this.driver?.streamConnected() || false;
+    const pendingCount = this.inboxSupported === false ? 0 : this.inbox.size;
+    const pendingLabel = `${pendingCount} prompt${pendingCount === 1 ? "" : "s"} pending`;
     this.sendButton.disabled = !!this.offline || !this.inputEl?.value?.trim();
     this.stopButton.disabled = !!this.offline || !this.busy;
     this.stopButton.style.display = "";
@@ -5875,7 +5974,13 @@ class SessionChatView extends ItemView {
     } else if (this.isDraft()) {
       this.hintEl.setText("Draft — your first message will create the session");
     } else if (this.busy) {
-      this.hintEl.setText("Streaming… new messages attach at the bottom; Stop interrupts");
+      this.hintEl.setText(
+        pendingCount
+          ? `Streaming… ${pendingLabel} — Stop interrupts`
+          : "Streaming… new messages attach at the bottom; Stop interrupts",
+      );
+    } else if (pendingCount) {
+      this.hintEl.setText(`${pendingLabel} — shown at the bottom of the transcript`);
     } else if (connected) {
       this.hintEl.setText("Live — connected to the OpenCode v2 event stream");
     } else {
@@ -6293,10 +6398,11 @@ class SessionChatView extends ItemView {
       this.setOffline(false);
       this.session = session;
       this.resetMessages();
-      this.appendMessages(
-        [...(messagesResponse?.data || [])].reverse(),
-        messagesResponse?.cursor?.next || null,
-      );
+      const listed = [...(messagesResponse?.data || [])];
+      this.appendMessages([...listed].reverse(), messagesResponse?.cursor?.next || null);
+      // Pending-inbox hydration (spec/010) needs the listing to tell
+      // delivered ids from cancelled ones.
+      this.refreshInbox(new Set(listed.map((message) => message.id))).catch(() => {});
       // If the session is already running (view opened mid-stream), adopt it.
       const live = this.driver.getLiveState(this.sessionId);
       this.setBusy(live?.status === "running" || live?.status === "waiting");
@@ -6743,14 +6849,134 @@ class SessionChatView extends ItemView {
     return { id, type, time, text, agent, model, content, error, finish };
   }
 
+  // ----- pending inbox (spec/010) ---------------------------------------------
+
+  // Tracks a live-arriving inbox item and (re)renders its bubble with the
+  // pending chrome. upsertMessage diffs payloads only, so the record is
+  // always re-rendered explicitly — a pending-state change never changes
+  // the payload JSON.
+  trackInboxItem(item) {
+    this.inbox.set(item.id, item);
+    const record = this.upsertMessage(inboxMessageFrom(item));
+    if (record) this.renderMessageBody(record);
+    this.updateComposer();
+  }
+
+  // Drops a message record + element. Used for cancelled inbox items —
+  // the id never became a real message, so nothing may stay on screen.
+  removeMessage(id) {
+    const record = this.messages.get(id);
+    if (!record) return;
+    record.el.remove();
+    this.messages.delete(id);
+    const index = this.order.indexOf(id);
+    if (index >= 0) this.order.splice(index, 1);
+  }
+
+  // Rehydrates pending state from GET /api/session/:id/inbox. `listedIds`
+  // are the ids present in the freshest message listing: an id that left
+  // the server inbox and IS listed was delivered (strip chrome, keep the
+  // bubble); absent from both, it was cancelled (drop the bubble). This
+  // heals missed SSE events after reconnects. Servers without the endpoint
+  // (404/405) fall back to legacy rendering: no chrome, no actions.
+  async refreshInbox(listedIds = null) {
+    if (!this.sessionId || !this.driver || this.isDraft()) return;
+    if (typeof this.driver.client?.inboxList !== "function") return;
+    let response;
+    try {
+      response = await this.driver.client.inboxList(this.sessionId);
+    } catch (error) {
+      if (/^40[45]/.test(String(error.message)) && this.inboxSupported !== false) {
+        this.inboxSupported = false;
+        this.inbox.clear();
+        for (const record of this.messages.values()) this.renderMessageBody(record);
+        this.updateComposer();
+      }
+      return;
+    }
+    if (this.unsubscribed) return;
+    this.inboxSupported = true;
+    const next = new Map();
+    for (const raw of response?.data || []) {
+      const item = normalizeInboxItem(raw);
+      if (item) next.set(item.id, item);
+    }
+    for (const item of next.values()) {
+      this.inbox.set(item.id, item);
+      const record = this.upsertMessage(inboxMessageFrom(item));
+      if (record) this.renderMessageBody(record);
+    }
+    for (const id of [...this.inbox.keys()]) {
+      if (next.has(id)) continue;
+      this.inbox.delete(id);
+      if (listedIds && !listedIds.has(id)) {
+        // Absent from the server inbox AND the message listing: cancelled —
+        // the id never became a message, so drop the bubble.
+        this.removeMessage(id);
+      } else {
+        // Delivered (it is listed) or unknown (no listing to consult):
+        // strip the chrome, keep the bubble — deleting a delivered message
+        // would lose content until the next full refresh.
+        const record = this.messages.get(id);
+        if (record) this.renderMessageBody(record);
+      }
+    }
+    this.updateComposer();
+  }
+
+  // Cancel (DELETE) a pending item. `recall` additionally puts a user
+  // prompt's text back into the composer — the TUI's ctrl+u "undo".
+  async cancelInboxItem(inboxId, options = {}) {
+    if (!this.sessionId || !this.driver) return;
+    const pending = this.inbox.get(inboxId);
+    try {
+      await this.driver.client.inboxCancel(this.sessionId, inboxId);
+    } catch (error) {
+      new Notice(`Cancel failed: ${error.message}`);
+      return;
+    }
+    if (options.recall && pending?.type === "user" && pending.text && this.inputEl && !this.readOnly) {
+      const current = this.inputEl.value.trim();
+      this.inputEl.value = current ? `${current}\n${pending.text}` : pending.text;
+      this.autoGrow();
+      this.updateCommandMenu();
+      this.updateComposer();
+      this.inputEl.focus();
+    }
+    // Removal itself rides the session.inbox.cancelled event; a missed
+    // event is healed by the next refreshInbox.
+  }
+
+  // Flips steer ⇄ queue (PATCH). The optimistic local flip keeps the row
+  // responsive; session.inbox.delivery.changed confirms or corrects it.
+  async toggleInboxDelivery(inboxId) {
+    const pending = this.inbox.get(inboxId);
+    if (!pending || !this.sessionId || !this.driver) return;
+    const next = pending.delivery === "queue" ? "steer" : "queue";
+    pending.delivery = next;
+    const record = this.messages.get(inboxId);
+    if (record) this.renderMessageBody(record);
+    try {
+      await this.driver.client.inboxUpdate(this.sessionId, inboxId, next);
+    } catch (error) {
+      pending.delivery = next === "queue" ? "steer" : "queue";
+      if (record) this.renderMessageBody(record);
+      new Notice(`Could not change delivery: ${error.message}`);
+    }
+  }
+
   renderMessageBody(record) {
     const { el, msg } = record;
     el.empty();
     el.className = `oc-msg oc-msg-${msg.type || "system"}`;
     if (msg.type === "user") {
-      const bubble = el.createDiv({ cls: "oc-bubble oc-bubble-user" });
+      const pending = this.pendingInbox(msg.id);
+      const bubble = el.createDiv({
+        cls: `oc-bubble oc-bubble-user${pending ? " is-pending" : ""}`,
+      });
       bubble.setText(String(msg.text ?? ""));
       this.renderAttachments(bubble, msg);
+      if (pending) this.renderInboxRow(el, pending);
       return;
     }
     if (msg.type === "assistant") {
@@ -6781,9 +7007,61 @@ class SessionChatView extends ItemView {
     }
     // system / synthetic / compaction / agent-switched / model-switched / …
     const note = el.createDiv({ cls: "oc-note" });
+    const pending = this.pendingInbox(msg.id);
+    if (pending) note.addClass("is-pending");
     const label = String(msg.type || "system").replaceAll("-", " ");
     note.createSpan({ cls: "oc-note-kind", text: label });
     if (msg.text) note.createSpan({ text: ` — ${msg.text}` });
+    if (pending) this.renderInboxRow(el, pending);
+  }
+
+  // Pending-inbox access for rendering (spec/010): chrome is suppressed on
+  // servers without the inbox API so their bubbles render legacy-style.
+  pendingInbox(id) {
+    if (this.inboxSupported === false) return null;
+    return this.inbox.get(id) || null;
+  }
+
+  // Status + action row under a pending bubble/note: delivery mode, and the
+  // controls the inbox API allows — flip steer/queue, recall into the
+  // composer, cancel.
+  renderInboxRow(container, pending) {
+    const row = container.createDiv({ cls: "oc-inbox-row" });
+    const status = row.createSpan({ cls: "oc-inbox-status" });
+    status.createSpan({ cls: "oc-inbox-dot" });
+    status.createSpan({
+      text:
+        pending.delivery === "queue"
+          ? "Queued — runs when the session is idle"
+          : "Sent — picks up at the next step boundary",
+    });
+    if (this.inboxSupported === false) return;
+    const actions = row.createDiv({ cls: "oc-inbox-actions" });
+    const toggle = actions.createEl("button", {
+      cls: "oc-inbox-button",
+      text: pending.delivery === "queue" ? "Steer now" : "Move to queue",
+      attr: {
+        title:
+          pending.delivery === "queue"
+            ? "Deliver at the next step boundary, even mid-turn"
+            : "Hold until the current turn finishes",
+      },
+    });
+    toggle.addEventListener("click", () => this.toggleInboxDelivery(pending.id));
+    if (pending.type === "user") {
+      const recall = actions.createEl("button", {
+        cls: "oc-inbox-button",
+        text: "Recall",
+        attr: { title: "Cancel and put the text back in the composer" },
+      });
+      recall.addEventListener("click", () => this.cancelInboxItem(pending.id, { recall: true }));
+    }
+    const cancel = actions.createEl("button", {
+      cls: "oc-inbox-button oc-inbox-cancel",
+      text: "Cancel",
+      attr: { title: "Cancel this message before the session processes it" },
+    });
+    cancel.addEventListener("click", () => this.cancelInboxItem(pending.id));
   }
 
   renderAttachments(container, msg) {
@@ -7164,19 +7442,46 @@ class SessionChatView extends ItemView {
           this.renderHeader();
         }
         break;
-      case "session.inbox.enqueued":
-        if (data.item?.type === "user") {
-          this.upsertMessage({
-            id: data.inboxID,
-            type: "user",
-            time: { created: event.created || Date.now() },
-            text: data.item.payload?.text || "",
-            files: data.item.payload?.files,
-            agents: data.item.payload?.agents,
-            skills: data.item.payload?.skills,
-          });
-        }
+      case "session.inbox.enqueued": {
+        // Any client's send (TUI, another tab) surfaces here; user prompts
+        // become pending bubbles, control items pending notes (spec/010).
+        // The wire item carries no id/time of its own — both come from the
+        // envelope (inboxID is the future message id).
+        const item = normalizeInboxItem({
+          ...(data.item || {}),
+          id: data.inboxID,
+          time: { created: event.created },
+        });
+        if (item) this.trackInboxItem(item);
         break;
+      }
+      case "session.inbox.delivered": {
+        // The inbox row became a real message with the same id: strip the
+        // pending chrome, keep the bubble in place.
+        if (!this.inbox.has(data.inboxID)) break;
+        this.inbox.delete(data.inboxID);
+        const record = this.messages.get(data.inboxID);
+        if (record) this.renderMessageBody(record);
+        this.updateComposer();
+        break;
+      }
+      case "session.inbox.cancelled": {
+        // Cancelled anywhere (this view, the TUI): the id never became a
+        // message, so the pending bubble goes away entirely.
+        if (!this.inbox.delete(data.inboxID)) break;
+        this.removeMessage(data.inboxID);
+        this.updateComposer();
+        break;
+      }
+      case "session.inbox.delivery.changed": {
+        const item = this.inbox.get(data.inboxID);
+        if (!item) break;
+        item.delivery = data.delivery === "queue" ? "queue" : "steer";
+        const record = this.messages.get(data.inboxID);
+        if (record) this.renderMessageBody(record);
+        this.updateComposer();
+        break;
+      }
       case "session.step.started":
         this.ensureAssistantMessage(data.assistantMessageID, data.agent, data.model);
         this.setBusy(true);
@@ -7780,9 +8085,13 @@ class SessionChatView extends ItemView {
       const limit = Math.min(Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size), 300);
       const response = await this.driver.listMessages(this.sessionId, { limit, order: "desc" });
       if (this.unsubscribed) return;
-      for (const message of [...(response?.data || [])].reverse()) {
+      const listed = [...(response?.data || [])];
+      for (const message of [...listed].reverse()) {
         this.upsertMessage(message);
       }
+      // Keep pending-inbox state honest (missed delivered/cancelled events
+      // during an SSE gap resolve here); the listing disambiguates.
+      await this.refreshInbox(new Set(listed.map((message) => message.id))).catch(() => {});
       const session = await this.driver.getSession(this.sessionId).catch(() => null);
       if (!this.unsubscribed && session) {
         this.session = session;
@@ -7847,12 +8156,12 @@ class SessionChatView extends ItemView {
     return el;
   }
 
-  async send() {
+  async send(delivery = "steer") {
     if (this.offline || !this.driver) return;
     const text = this.inputEl.value.trim();
     if (!text) return;
     if (this.isDraft()) {
-      await this.sendDraft(text);
+      await this.sendDraft(text, delivery);
       return;
     }
     this.closeCommandMenu();
@@ -7863,7 +8172,7 @@ class SessionChatView extends ItemView {
     // visible immediately, wherever the transcript was scrolled (spec/009).
     this.jumpToBottom(true);
     try {
-      await this.deliverText(this.sessionId, text);
+      await this.deliverText(this.sessionId, text, delivery);
     } catch (error) {
       new Notice(`Send failed: ${error.message}`);
       this.inputEl.value = text;
@@ -7875,21 +8184,31 @@ class SessionChatView extends ItemView {
   // Sends already-validated text to an existing session. Routes a leading
   // "/command" through the command endpoint when the name matches a loaded
   // server command (the TUI's rule — unknown /names stay plain prompts);
-  // everything else goes through the prompt API.
-  async deliverText(sessionId, text) {
+  // everything else goes through the prompt API. `delivery` ("steer"|
+  // "queue", spec/010) applies to prompts only — the command endpoint
+  // takes none.
+  async deliverText(sessionId, text, delivery = "steer") {
     const parsed = parseComposerCommand(text);
     const known = parsed ? this.commands.some((command) => command?.name === parsed.name) : false;
     const response = known
       ? await this.driver.client.runCommand(sessionId, parsed.name, parsed.args)
-      : await this.driver.client.prompt(sessionId, text);
+      : await this.driver.client.prompt(sessionId, text, delivery);
     const user = response?.data;
     if (user?.id) {
-      this.upsertMessage({
+      // Newer v2 answers with the inbox item (a `delivery` field marks it);
+      // track it as pending so the chrome renders even if the enqueued
+      // event races the response (spec/010).
+      if (typeof user.delivery === "string") {
+        const item = normalizeInboxItem(user);
+        if (item) this.inbox.set(item.id, item);
+      }
+      const record = this.upsertMessage({
         id: user.id,
         type: "user",
         time: { created: user.time?.created || Date.now() },
         text: user.payload?.text || text,
       });
+      if (record && this.pendingInbox(user.id)) this.renderMessageBody(record);
     } else if (known) {
       // Released v2 answers the command endpoint 204/no-body: no synthetic
       // bubble — the real message arrives via session.inbox.enqueued (or
@@ -7908,7 +8227,7 @@ class SessionChatView extends ItemView {
 
   // Drafts create the server session lazily with the first message, so no
   // empty sessions pile up when a draft is abandoned.
-  async sendDraft(text) {
+  async sendDraft(text, delivery = "steer") {
     try {
       // Snippet config gate (spec/007): read-only diff of the snippet's
       // desired state against the live directory; a diff opens the
@@ -7949,7 +8268,7 @@ class SessionChatView extends ItemView {
       this.inputEl.value = "";
       this.autoGrow();
       this.jumpToBottom(true);
-      await this.deliverText(session.id, text);
+      await this.deliverText(session.id, text, delivery);
     } catch (error) {
       new Notice(`Could not create session: ${error.message}`);
     }

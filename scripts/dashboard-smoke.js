@@ -17,7 +17,7 @@ src = src.replace(
   obsidianLine,
   `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class {}, TFile = class {}, TFolder = class {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, normalizeMcpList, normalizeCommandList, normalizeSkillList };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, normalizeMcpList, normalizeCommandList, normalizeSkillList, normalizeInboxItem, inboxMessageFrom };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
@@ -47,6 +47,8 @@ const {
   normalizeMcpList,
   normalizeCommandList,
   normalizeSkillList,
+  normalizeInboxItem,
+  inboxMessageFrom,
 } = require(tmp);
 
 function makeEl(tag, opts = {}) {
@@ -548,6 +550,42 @@ const check = (name, fn) => {
     const skills = normalizeSkillList({ data: [{ id: "b" }, { id: "a", description: "does things" }, { }] });
     if (skills.length !== 2 || skills[0].name !== "a" || skills[0].description !== "does things") {
       throw new Error("skill normalization wrong");
+    }
+  });
+
+  check("normalizeInboxItem and inboxMessageFrom shape pending inbox items", () => {
+    const user = normalizeInboxItem({
+      id: "msg_1",
+      type: "user",
+      payload: { text: "fix the login bug", files: [{ name: "auth.ts" }] },
+      delivery: "queue",
+      time: { created: 1760000000000 },
+    });
+    if (!user || user.delivery !== "queue" || user.text !== "fix the login bug") {
+      throw new Error("user item wrong");
+    }
+    if (!Array.isArray(user.files) || user.files[0].name !== "auth.ts") throw new Error("files must pass through");
+    const message = inboxMessageFrom(user);
+    if (message.id !== "msg_1" || message.type !== "user" || message.time.created !== 1760000000000) {
+      throw new Error("user projection wrong");
+    }
+    // Steer is the default delivery; missing time falls back to now.
+    const steer = normalizeInboxItem({ id: "msg_2", type: "user", payload: { text: "hi" } });
+    if (steer.delivery !== "steer" || !Number.isFinite(steer.created)) throw new Error("defaults wrong");
+    // Control items keep type + label text and project to note messages.
+    const compaction = normalizeInboxItem({ id: "msg_3", type: "compaction", payload: {}, delivery: "steer" });
+    if (compaction.text !== "" || compaction.delivery !== "steer") throw new Error("compaction wrong");
+    const note = inboxMessageFrom(compaction);
+    if (note.type !== "compaction" || "files" in note) throw new Error("note projection wrong");
+    const synthetic = normalizeInboxItem({
+      id: "msg_4",
+      type: "synthetic",
+      payload: { description: "summarize", text: "irrelevant" },
+    });
+    if (synthetic.text !== "summarize") throw new Error("synthetic must prefer description");
+    // Junk and unknown types are rejected, never crash.
+    if (normalizeInboxItem(null) || normalizeInboxItem({}) || normalizeInboxItem({ id: "x", type: "weird", payload: {} })) {
+      throw new Error("invalid input must yield null");
     }
   });
 
