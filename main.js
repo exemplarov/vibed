@@ -2293,10 +2293,36 @@ class OpenCode2Driver extends ConnectorDriver {
       for (const sessionId of active) {
         this.liveStates.set(sessionId, { status: "running", at: Date.now() });
       }
+      await this.syncBlockedPermissions([...active]);
       this.plugin.emitChange();
     } catch {
       // discovery failures surface elsewhere
     }
+  }
+
+  // A session blocked on approvals still reports "running" in
+  // /api/session/active, and the event stream never replays permission.asked
+  // events a disconnected client missed — so re-derive the "waiting" state
+  // from each active session's pending permission list (the TUI hydrates the
+  // same way on reconnect).
+  async syncBlockedPermissions(sessionIds) {
+    if (!sessionIds.length || typeof this.client.sessionPermissions !== "function") return;
+    await Promise.all(
+      sessionIds.map(async (sessionId) => {
+        try {
+          const response = await this.client.sessionPermissions(sessionId);
+          const blocked = (response?.data || []).length > 0;
+          const state = this.liveStates.get(sessionId);
+          if (blocked && state?.status !== "waiting") {
+            this.liveStates.set(sessionId, { status: "waiting", at: Date.now() });
+          } else if (!blocked && state?.status === "waiting") {
+            this.liveStates.set(sessionId, { status: "running", at: Date.now() });
+          }
+        } catch {
+          // per-session probe failure keeps the event-derived state
+        }
+      }),
+    );
   }
 
   // ----- listing ---------------------------------------------------------------
@@ -5278,6 +5304,18 @@ const MCP_STATUS_META = {
 // /api/event connection; prompt + interrupt included.
 // ---------------------------------------------------------------------------
 
+// Normalizes a permission request — from the API list or a permission.asked
+// event, both carry the same shape — into the banner render target.
+function permissionView(request) {
+  return {
+    id: request.id,
+    action: request.action || "permission",
+    resources: Array.isArray(request.resources) ? request.resources : [],
+    save: Array.isArray(request.save) ? request.save : [],
+    message: request.message || "",
+  };
+}
+
 class SessionChatView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -5311,7 +5349,10 @@ class SessionChatView extends ItemView {
     this.unsubscribed = false;
     this.reconcileTimer = null;
     this.loadSeq = 0;
-    this.pendingPermission = null;
+    // Pending permissions are a batch: a parallel tool block parks one ask
+    // per tool, all of them live until each is replied.
+    this.pendingPermissions = [];
+    this.pendingPermission = null; // head of pendingPermissions (render target)
     this.replyingPermission = false;
     this.pendingQuestion = null;
     this.replyingQuestion = false;
@@ -7588,25 +7629,30 @@ class SessionChatView extends ItemView {
 
   setPendingPermission(request) {
     if (!request?.id || !this.sessionId) return;
-    this.pendingPermission = {
-      id: request.id,
-      action: request.action || "permission",
-      resources: Array.isArray(request.resources) ? request.resources : [],
-      save: Array.isArray(request.save) ? request.save : [],
-      message: request.message || "",
-    };
+    // Live asks append: a parallel tool batch fires one event per tool, and
+    // re-rendering the head would clobber its own buttons mid-batch.
+    if (this.pendingPermissions.some((item) => item.id === request.id)) return;
+    this.pendingPermissions.push(permissionView(request));
+    this.pendingPermission = this.pendingPermissions[0];
     this.renderPermissionBanner();
     this.renderBadge();
     this.updateComposer();
   }
 
   clearPendingPermission(requestId) {
-    if (!this.pendingPermission) return;
-    if (requestId && this.pendingPermission.id !== requestId) return;
-    this.pendingPermission = null;
+    const next = requestId
+      ? this.pendingPermissions.filter((item) => item.id !== requestId)
+      : [];
+    if (next.length === this.pendingPermissions.length && requestId) return;
+    this.pendingPermissions = next;
+    this.pendingPermission = next[0] || null;
     this.renderPermissionBanner();
     this.renderBadge();
     this.updateComposer();
+    // A reply can unlock the agent loop into asks this view never saw (the
+    // event stream does not replay requests asked during a disconnect) —
+    // re-sync the pending set from the server.
+    this.refreshPendingPermission().catch(() => {});
   }
 
   // Recovers a pending approval on view open / refresh (e.g. a session that
@@ -7617,12 +7663,19 @@ class SessionChatView extends ItemView {
     try {
       const response = await this.driver.client.sessionPermissions(this.sessionId);
       if (this.unsubscribed) return;
-      const pending = (response?.data || [])[0] || null;
-      if (pending) {
-        this.setPendingPermission(pending);
-      } else if (this.pendingPermission) {
-        this.clearPendingPermission();
-      }
+      // Server truth replaces the tracked batch wholesale: replies made
+      // elsewhere while the event stream was down resolve here, as do asks
+      // missed during a disconnect gap (the stream does not replay them).
+      const next = (Array.isArray(response?.data) ? response.data : []).map(permissionView);
+      const changed =
+        next.length !== this.pendingPermissions.length ||
+        next.some((item, index) => item.id !== this.pendingPermissions[index]?.id);
+      if (!changed) return;
+      this.pendingPermissions = next;
+      this.pendingPermission = next[0] || null;
+      this.renderPermissionBanner();
+      this.renderBadge();
+      this.updateComposer();
     } catch {
       // server hiccup — the event stream keeps us informed anyway
     }
@@ -7640,9 +7693,10 @@ class SessionChatView extends ItemView {
     banner.style.display = "";
     const head = banner.createDiv({ cls: "oc-permission-head" });
     setIcon(head.createSpan({ cls: "oc-permission-icon" }), "shield-alert");
+    const total = this.pendingPermissions.length;
     head.createSpan({
       cls: "oc-permission-title",
-      text: `Needs approval — ${String(action).replaceAll("_", " ")}`,
+      text: `Needs approval — ${String(action).replaceAll("_", " ")}${total > 1 ? ` (1 of ${total})` : ""}`,
     });
     if (resources.length) {
       const list = banner.createDiv({ cls: "oc-permission-resources" });
