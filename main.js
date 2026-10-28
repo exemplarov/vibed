@@ -2168,6 +2168,10 @@ class OpenCode2Driver extends ConnectorDriver {
     this.client = new OpenCodeClient(connector);
     // sessionID -> { status, at } live states from this server's stream.
     this.liveStates = new Map();
+    // Blocked-descendant surfacing (spec/011): probes of the active set.
+    this.blockedAsks = new Map(); // sessionID -> pending permission requests
+    this.blockedQuestions = new Set(); // sessionIDs with pending question forms
+    this.sessionParents = new Map(); // sessionID -> parentID|null cache
     this.stream = new ServerEventStream(plugin, this);
   }
 
@@ -2293,7 +2297,7 @@ class OpenCode2Driver extends ConnectorDriver {
       for (const sessionId of active) {
         this.liveStates.set(sessionId, { status: "running", at: Date.now() });
       }
-      await this.syncBlockedPermissions([...active]);
+      await this.syncBlockedStates([...active]);
       this.plugin.emitChange();
     } catch {
       // discovery failures surface elsewhere
@@ -2304,25 +2308,98 @@ class OpenCode2Driver extends ConnectorDriver {
   // /api/session/active, and the event stream never replays permission.asked
   // events a disconnected client missed — so re-derive the "waiting" state
   // from each active session's pending permission list (the TUI hydrates the
-  // same way on reconnect).
-  async syncBlockedPermissions(sessionIds) {
+  // same way on reconnect). Question forms have the identical gap: the
+  // "question" state only ever came from a live form.created event, so probe
+  // both endpoints and remember the blockers for ancestor surfacing
+  // (spec/011).
+  async syncBlockedStates(sessionIds) {
     if (!sessionIds.length || typeof this.client.sessionPermissions !== "function") return;
     await Promise.all(
       sessionIds.map(async (sessionId) => {
+        let asks = [];
+        let questions = 0;
         try {
           const response = await this.client.sessionPermissions(sessionId);
-          const blocked = (response?.data || []).length > 0;
-          const state = this.liveStates.get(sessionId);
-          if (blocked && state?.status !== "waiting") {
-            this.liveStates.set(sessionId, { status: "waiting", at: Date.now() });
-          } else if (!blocked && state?.status === "waiting") {
-            this.liveStates.set(sessionId, { status: "running", at: Date.now() });
-          }
+          asks = Array.isArray(response?.data) ? response.data : [];
         } catch {
           // per-session probe failure keeps the event-derived state
         }
+        if (typeof this.client.sessionForms === "function") {
+          try {
+            const forms = await this.client.sessionForms(sessionId);
+            questions = (forms?.data || []).length;
+          } catch {
+            // same tolerance as asks
+          }
+        }
+        const blocked = asks.length > 0;
+        const questioning = questions > 0;
+        if (blocked) this.blockedAsks.set(sessionId, asks);
+        else this.blockedAsks.delete(sessionId);
+        if (questioning) this.blockedQuestions.add(sessionId);
+        else this.blockedQuestions.delete(sessionId);
+        const state = this.liveStates.get(sessionId);
+        if (blocked && state?.status !== "waiting") {
+          this.liveStates.set(sessionId, { status: "waiting", at: Date.now() });
+        } else if (!blocked && state?.status === "waiting") {
+          this.liveStates.set(sessionId, { status: "running", at: Date.now() });
+        }
+        if (questioning && state?.status !== "waiting" && state?.status !== "question") {
+          this.liveStates.set(sessionId, { status: "question", at: Date.now() });
+        } else if (!questioning && !blocked && state?.status === "question") {
+          this.liveStates.set(sessionId, { status: "running", at: Date.now() });
+        }
       }),
     );
+  }
+
+  // sessionID -> parentID|null, cached. Task-tool subsessions rarely
+  // re-parent, so the cache lives for the driver's lifetime.
+  async parentOf(sessionId) {
+    if (this.sessionParents.has(sessionId)) return this.sessionParents.get(sessionId);
+    let parent = null;
+    try {
+      const response = await this.client.session(sessionId);
+      parent = response?.data?.parentID || null;
+    } catch {
+      return null; // unresolvable now; not cached, a later pass can retry
+    }
+    this.sessionParents.set(sessionId, parent);
+    return parent;
+  }
+
+  // Walks a session's ancestor chain (depth-capped, cycle-guarded) and
+  // returns the ids from its parent up to the root, oldest first.
+  async ancestorChain(sessionId) {
+    const chain = [];
+    const seen = new Set([sessionId]);
+    let current = sessionId;
+    for (let depth = 0; depth < 10; depth++) {
+      const parent = await this.parentOf(current);
+      if (!parent || seen.has(parent)) break;
+      seen.add(parent);
+      chain.push(parent);
+      current = parent;
+    }
+    return chain;
+  }
+
+  // Pending permission asks / question forms parked on any DESCENDANT of
+  // `sessionId` (child or deeper) — the parent-banner payload (spec/011).
+  async descendantBlockers(sessionId) {
+    const asks = [];
+    const questionSessions = [];
+    for (const [childId, childAsks] of this.blockedAsks) {
+      if (childId === sessionId) continue;
+      if ((await this.ancestorChain(childId)).includes(sessionId)) {
+        for (const ask of childAsks) asks.push(permissionView({ ...ask, sessionID: childId }));
+      }
+    }
+    for (const childId of this.blockedQuestions) {
+      if (childId === sessionId) continue;
+      if ((await this.ancestorChain(childId)).includes(sessionId)) questionSessions.push(childId);
+    }
+    return { asks, questionSessions };
   }
 
   // ----- listing ---------------------------------------------------------------
@@ -4785,7 +4862,16 @@ class SessionsDashboard {
           (a, b) => Number(a.time_created || 0) - Number(b.time_created || 0),
         );
         row.subsessionsActive = row.subsessions.filter((child) => this.subsessionActive(child)).length;
-        if (row.rawState === "running" && row.subsessionsActive > 0) {
+        // A child blocked on a human blocks the parent's turn too — surface
+        // that on the parent card (spec/011), outranking plain delegating.
+        const childStates = children.map((child) => String(child.state || "").toLowerCase());
+        if (childStates.includes("waiting")) {
+          row.state = "waiting";
+          row.stateLabel = "Subagent needs approval";
+        } else if (childStates.includes("question")) {
+          row.state = "question";
+          row.stateLabel = "Subagent needs answer";
+        } else if (row.rawState === "running" && row.subsessionsActive > 0) {
           row.state = "delegating";
           row.stateLabel = STATE_LABELS.delegating;
         } else {
@@ -5306,9 +5392,12 @@ const MCP_STATUS_META = {
 
 // Normalizes a permission request — from the API list or a permission.asked
 // event, both carry the same shape — into the banner render target.
+// `sessionID` rides along: subagent asks render on the parent but reply
+// against the child session (spec/011).
 function permissionView(request) {
   return {
     id: request.id,
+    sessionID: request.sessionID || null,
     action: request.action || "permission",
     resources: Array.isArray(request.resources) ? request.resources : [],
     save: Array.isArray(request.save) ? request.save : [],
@@ -5354,6 +5443,11 @@ class SessionChatView extends ItemView {
     this.pendingPermissions = [];
     this.pendingPermission = null; // head of pendingPermissions (render target)
     this.replyingPermission = false;
+    // Subagent blockers surfaced on this (parent) view (spec/011): asks
+    // parked on descendant sessions, and descendants with question forms.
+    this.descendantAsks = [];
+    this.descendantQuestionIds = new Set();
+    this.replyingDescendant = false;
     this.pendingQuestion = null;
     this.replyingQuestion = false;
     // question key -> selected option value(s), custom text, boolean, number
@@ -5748,6 +5842,12 @@ class SessionChatView extends ItemView {
     this.permissionEl = main.createDiv({ cls: "oc-permission" });
     this.permissionEl.style.display = "none";
 
+    // Subagent blockers (spec/011): asks/questions parked on descendant
+    // sessions, surfaced here so the parent thread matches the TUI. Same
+    // placement; own approvals above, subagent ones below.
+    this.descendantEl = main.createDiv({ cls: "oc-permission oc-permission-subagent" });
+    this.descendantEl.style.display = "none";
+
     // Agent question banner: same placement rationale — the session is
     // paused until the batch is answered or dismissed.
     this.questionEl = main.createDiv({ cls: "oc-question" });
@@ -6043,6 +6143,8 @@ class SessionChatView extends ItemView {
       this.hintEl.setText("Waiting for your approval — the session is paused");
     } else if (this.pendingQuestion) {
       this.hintEl.setText("Waiting for your answer — the session is paused");
+    } else if (this.descendantAsks.length || this.descendantQuestionIds.size) {
+      this.hintEl.setText("A subagent is waiting on you — see the banner below");
     } else if (this.isDraft()) {
       this.hintEl.setText("Draft — your first message will create the session");
     } else if (this.busy) {
@@ -6083,6 +6185,10 @@ class SessionChatView extends ItemView {
       state = "waiting";
     } else if (this.pendingQuestion) {
       state = "question";
+    } else if (this.descendantAsks.length) {
+      state = "waiting"; // a subagent is blocked on approval (spec/011)
+    } else if (this.descendantQuestionIds.size) {
+      state = "question"; // a subagent is blocked on a question (spec/011)
     } else if (this.busy) {
       state = "running";
     } else if (live) {
@@ -6486,6 +6592,7 @@ class SessionChatView extends ItemView {
       this.loadCommands().catch(() => {});
       this.refreshPendingPermission().catch(() => {});
       this.refreshPendingQuestion().catch(() => {});
+      this.refreshPendingDescendants().catch(() => {});
     } catch (error) {
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(true, error.message);
@@ -7605,20 +7712,36 @@ class SessionChatView extends ItemView {
         this.finalizeStep(data);
         break;
       case "permission.asked":
-        this.setPendingPermission(data);
+        // Foreign sessionID = an ask parked on a subagent, re-delivered here
+        // via the ancestor fan-out (spec/011): surface it on the parent.
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.addDescendantPermission(data);
+        } else {
+          this.setPendingPermission(data);
+        }
         break;
       case "permission.replied":
-        // Covers replies made anywhere (this banner, the TUI, elsewhere).
+        // Covers replies made anywhere (this banner, the TUI, elsewhere) —
+        // own asks and subagent asks alike.
+        this.clearDescendantPermission(data?.requestID);
         this.clearPendingPermission(data?.requestID);
         break;
       case "form.created":
         // Released v2 servers surface the question tool as a form
         // (metadata.kind === "question").
-        this.setPendingQuestion(this.driver?.client?.normalizeForms({ data: [data.form] })[0] || null);
+        if (data.form?.sessionID && data.form.sessionID !== this.sessionId) {
+          this.addDescendantQuestion(data.form.sessionID);
+        } else {
+          this.setPendingQuestion(this.driver?.client?.normalizeForms({ data: [data.form] })[0] || null);
+        }
         break;
       case "form.replied":
       case "form.cancelled":
-        this.clearPendingQuestion(data?.id);
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.removeDescendantQuestion(data.sessionID);
+        } else {
+          this.clearPendingQuestion(data?.id);
+        }
         break;
       default:
         break;
@@ -7738,6 +7861,128 @@ class SessionChatView extends ItemView {
       }
     } finally {
       this.replyingPermission = false;
+    }
+  }
+
+  // ----- subagent blockers (spec/011) -----------------------------------------
+
+  addDescendantPermission(request) {
+    if (!request?.id || !request.sessionID) return;
+    if (this.descendantAsks.some((item) => item.id === request.id)) return;
+    this.descendantAsks.push(permissionView(request));
+    this.renderDescendantBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  clearDescendantPermission(requestId) {
+    if (!requestId || !this.descendantAsks.some((item) => item.id === requestId)) return;
+    this.descendantAsks = this.descendantAsks.filter((item) => item.id !== requestId);
+    this.renderDescendantBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  addDescendantQuestion(sessionId) {
+    if (!sessionId || this.descendantQuestionIds.has(sessionId)) return;
+    this.descendantQuestionIds.add(sessionId);
+    this.renderDescendantBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  removeDescendantQuestion(sessionId) {
+    if (!sessionId || !this.descendantQuestionIds.delete(sessionId)) return;
+    this.renderDescendantBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  // Rehydrates subagent blockers from the server (the stream does not replay
+  // asks missed while disconnected — same gap the own-ask refresh heals).
+  async refreshPendingDescendants() {
+    if (!this.sessionId || !this.driver || this.offline) return;
+    if (typeof this.driver.descendantBlockers !== "function") return;
+    try {
+      const blockers = await this.driver.descendantBlockers(this.sessionId);
+      if (this.unsubscribed) return;
+      this.descendantAsks = blockers.asks || [];
+      this.descendantQuestionIds = new Set(blockers.questionSessions || []);
+    } catch {
+      return; // event fan-out keeps us informed anyway
+    }
+    this.renderDescendantBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  renderDescendantBanner() {
+    const banner = this.descendantEl;
+    if (!banner) return;
+    banner.empty();
+    if (!this.descendantAsks.length && !this.descendantQuestionIds.size) {
+      banner.style.display = "none";
+      return;
+    }
+    banner.style.display = "";
+    if (this.descendantAsks.length) {
+      const ask = this.descendantAsks[0];
+      const total = this.descendantAsks.length;
+      const head = banner.createDiv({ cls: "oc-permission-head" });
+      setIcon(head.createSpan({ cls: "oc-permission-icon" }), "shield-alert");
+      head.createSpan({
+        cls: "oc-permission-title",
+        text: `Subagent needs approval — ${String(ask.action).replaceAll("_", " ")}${total > 1 ? ` (1 of ${total})` : ""}`,
+      });
+      if (ask.resources.length) {
+        const list = banner.createDiv({ cls: "oc-permission-resources" });
+        for (const resource of ask.resources) {
+          list.createEl("span", { cls: "oc-permission-resource", text: resource });
+        }
+      }
+      const actions = banner.createDiv({ cls: "oc-permission-actions" });
+      const reject = actions.createEl("button", { cls: "oc-permission-reject", text: "Reject" });
+      reject.addEventListener("click", () => this.replyToDescendantPermission(ask, "reject"));
+      if (ask.save.length) {
+        const always = actions.createEl("button", { cls: "oc-permission-always", text: "Always allow" });
+        always.addEventListener("click", () => this.replyToDescendantPermission(ask, "always"));
+      }
+      const allow = actions.createEl("button", { cls: "oc-permission-allow", text: "Allow" });
+      allow.addEventListener("click", () => this.replyToDescendantPermission(ask, "once"));
+      const open = actions.createEl("button", { cls: "oc-permission-open", text: "Open subsession" });
+      open.addEventListener("click", () =>
+        this.plugin.openSession({ connectorId: this.connectorId, sessionId: ask.sessionID }),
+      );
+    }
+    for (const sessionId of this.descendantQuestionIds) {
+      const row = banner.createDiv({ cls: "oc-permission-head" });
+      setIcon(row.createSpan({ cls: "oc-permission-icon" }), "help-circle");
+      row.createSpan({
+        cls: "oc-permission-title",
+        text: "Subagent needs answer — answer in its session",
+      });
+      const open = row.createEl("button", { cls: "oc-permission-open", text: "Open subsession" });
+      open.addEventListener("click", () =>
+        this.plugin.openSession({ connectorId: this.connectorId, sessionId }),
+      );
+    }
+  }
+
+  async replyToDescendantPermission(ask, reply) {
+    if (!ask?.id || !ask.sessionID || this.replyingDescendant) return;
+    this.replyingDescendant = true;
+    try {
+      await this.driver.client.replyPermission(ask.sessionID, ask.id, reply);
+      this.clearDescendantPermission(ask.id);
+      new Notice(`Subagent permission ${reply === "reject" ? "rejected" : reply === "always" ? "saved as always-allow" : "approved"}`);
+    } catch (error) {
+      if (String(error.message).startsWith("404")) {
+        this.clearDescendantPermission(ask.id);
+      } else {
+        new Notice(`Subagent permission reply failed: ${error.message}`);
+      }
+    } finally {
+      this.replyingDescendant = false;
     }
   }
 
@@ -8187,6 +8432,7 @@ class SessionChatView extends ItemView {
       if (this.driverCapabilities().permissions) {
         this.refreshPendingPermission().catch(() => {});
         this.refreshPendingQuestion().catch(() => {});
+        this.refreshPendingDescendants().catch(() => {});
       }
     } catch {
       // ignore — the next event or manual refresh will retry
@@ -10065,6 +10311,28 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
         }
       }
     }
+    // Subagent asks belong to the child session, but the human often watches
+    // the parent (the TUI shows them on the parent thread). Re-deliver ask/
+    // form events to every ancestor's listeners so parent banners can react
+    // (spec/011). Fire-and-forget: ancestor resolution needs a session fetch.
+    if (DESCENDANT_EVENT_TYPES.has(type) && typeof driver.ancestorChain === "function") {
+      driver
+        .ancestorChain(sessionId)
+        .then((ancestors) => {
+          for (const ancestorId of ancestors) {
+            const ancestorListeners = this.sessionListeners.get(`${driver.connector.id}:${ancestorId}`);
+            if (!ancestorListeners) continue;
+            for (const listener of [...ancestorListeners]) {
+              try {
+                listener(event);
+              } catch (error) {
+                console.error("OpenCode Sessions session listener failed:", error);
+              }
+            }
+          }
+        })
+        .catch(() => {});
+    }
     if (LIST_REFRESH_EVENTS.has(type)) this.scheduleListRefresh();
   }
 
@@ -10599,6 +10867,16 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     return "idle";
   }
 };
+
+// Events that carry a session's blocked-on-human state; re-delivered to the
+// session's ancestors so parent views can surface subagent asks (spec/011).
+const DESCENDANT_EVENT_TYPES = new Set([
+  "permission.asked",
+  "permission.replied",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+]);
 
 // Events that should trigger a debounced refresh of the SQLite-backed lists.
 const LIST_REFRESH_EVENTS = new Set([

@@ -1338,6 +1338,29 @@
   color: var(--color-red);
 }
 
+/* Subagent blockers (spec/011): same anatomy as the own-approval banner,
+   visually quieter — the acting session is not this one. The Open button
+   jumps to the child session. Question rows stack under the ask block. */
+.oc-permission-subagent {
+  border-color: color-mix(in srgb, var(--color-yellow) 45%, var(--background-modifier-border));
+  border-left-color: var(--color-yellow);
+  background: color-mix(in srgb, var(--color-yellow) 6%, var(--background-primary));
+}
+
+.oc-permission-subagent .oc-permission-head,
+.oc-permission-subagent .oc-permission-icon {
+  color: var(--color-yellow);
+}
+
+.oc-permission-subagent .oc-permission-head + .oc-permission-head {
+  margin-top: 0.45rem;
+}
+
+.oc-permission-actions button.oc-permission-open,
+.oc-permission-head button.oc-permission-open {
+  color: var(--text-muted);
+}
+
 /* Question banner (agent `question` tool) */
 .oc-question {
   flex: 0 0 auto;
