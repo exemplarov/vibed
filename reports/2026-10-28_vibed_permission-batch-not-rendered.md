@@ -1,6 +1,19 @@
 # vibed — approval banner not rendering for a parked permission batch (ses_e7f02c3f7ffeaRgeM74A4man6n)
 
-Date: 2026-10-28 · Status: fixed in main.js (unreleased)
+Date: 2026-10-28 · Status: fixed in main.js; superseded by spec/011 for the
+subagent case (v0.21.0, same day — see below)
+
+## Follow-up (v0.21.0): subagent asks on the parent thread
+
+After reload Roman identified the case the 0.20.1 fix did NOT cover: asks
+parked on **subagent** sessions surfaced only in the child chat (the TUI
+shows them on the parent thread). Shipped as spec/011: ancestor event
+fan-out, a subagent banner on the parent (reply against the child + open
+jump), descendant rehydration, driver-level waiting/question healing for
+active sessions, and dashboard parent cards re-stated when a child is
+blocked. Verified live end-to-end (parent/child pair via API, asks parked
+with the external permission.create endpoint, wire events captured).
+
 
 ## Report
 
