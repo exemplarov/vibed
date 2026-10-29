@@ -721,6 +721,13 @@ function formatTime(timestamp) {
 }
 
 function formatTokens(tokens) {
+  const total = sumTokens(tokens);
+  return total ? total.toLocaleString() : "";
+}
+
+// Numeric total of a usage payload (or a bare number) — input, output,
+// reasoning, and cache reads/writes all count.
+function sumTokens(tokens) {
   const numbers = [];
   if (tokens && typeof tokens === "object") {
     const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : {};
@@ -728,16 +735,54 @@ function formatTokens(tokens) {
   } else {
     numbers.push(tokens);
   }
-  const total = numbers.map(Number).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
-  return total ? total.toLocaleString() : "";
+  return numbers.map(Number).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
+}
+
+// Compact token counts, TUI-style: 283,200 -> "283.2K", 21,172,131 -> "21.2M".
+function compactTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const compact = (divisor, suffix) => `${(n / divisor).toFixed(1).replace(/\.0$/, "")}${suffix}`;
+  if (n >= 1000000) return compact(1000000, "M");
+  if (n >= 1000) return compact(1000, "K");
+  return String(n);
+}
+
+// Context-window usage of the latest assistant step — TUI parity: that
+// step's token sum against the model's context limit, e.g. "283.2K (28%)".
+// `tokens` comes from the last completed step (listing payload or
+// session.step.ended event); `models` is the picker's list, which carries
+// limit.context. Without a known limit only the compact count renders.
+function contextUsage(tokens, modelRef, models) {
+  const used = sumTokens(tokens);
+  if (!used) return null;
+  const model = Array.isArray(models)
+    ? models.find(
+        (entry) => entry?.id && modelRef?.id && entry.id === modelRef.id && entry.providerID === modelRef.providerID,
+      )
+    : null;
+  const window = Number(model?.limit?.context) || 0;
+  const percent = window ? Math.min(999, Math.round((used / window) * 100)) : null;
+  return {
+    used,
+    window,
+    percent,
+    label: percent === null ? compactTokens(used) : `${compactTokens(used)} (${percent}%)`,
+  };
 }
 
 function formatTokensFromRow(row) {
-  const total = [row.tokens_input, row.tokens_output, row.tokens_reasoning]
+  const total = [
+    row.tokens_input,
+    row.tokens_output,
+    row.tokens_reasoning,
+    row.tokens_cache_read,
+    row.tokens_cache_write,
+  ]
     .map(Number)
     .filter(Number.isFinite)
     .reduce((sum, value) => sum + value, 0);
-  return total ? total.toLocaleString() : "";
+  return compactTokens(total);
 }
 
 function displayDirectory(directory, vaultRoot) {
@@ -5438,6 +5483,12 @@ class SessionChatView extends ItemView {
     this.unsubscribed = false;
     this.reconcileTimer = null;
     this.loadSeq = 0;
+    // Context-window usage of the latest assistant step (TUI parity):
+    // tokens from the last completed step + the model ref that produced it,
+    // resolved against the picker's model list for the context limit.
+    this.contextTokens = null;
+    this.contextModel = null;
+    this.models = [];
     // Pending permissions are a batch: a parallel tool block parks one ask
     // per tool, all of them live until each is replied.
     this.pendingPermissions = [];
@@ -6246,7 +6297,21 @@ class SessionChatView extends ItemView {
         : "";
     }
     const model = this.session.model ? modelLabel(this.session.model) : "";
-    const tokens = formatTokens(this.session.tokens);
+    // TUI parity: "283.2K (28%)" context usage of the latest step, with the
+    // cumulative session total beside it. Exact figures go to the tooltip.
+    const usage = contextUsage(this.contextTokens, this.contextModel, this.models);
+    const total = sumTokens(this.session.tokens);
+    const tokensEntry = usage
+      ? `${usage.label}${total ? ` · ${compactTokens(total)} total` : ""}`
+      : total
+        ? `${compactTokens(total)} tokens`
+        : "";
+    this.metaEl.title = usage
+      ? `${usage.used.toLocaleString()} context tokens${usage.window ? ` of ${usage.window.toLocaleString()} (${usage.percent}%)` : ""}` +
+        (total ? ` · ${total.toLocaleString()} session total` : "")
+      : total
+        ? `${total.toLocaleString()} session tokens`
+        : "";
     const cost = Number(this.session.cost || 0);
     const directory = this.session.location?.directory || "";
     this.metaEl.setText(
@@ -6254,7 +6319,7 @@ class SessionChatView extends ItemView {
         this.session.agent || "",
         model,
         directory,
-        tokens ? `${tokens} tokens` : "",
+        tokensEntry,
         cost ? `$${cost.toFixed(2)}` : "",
         formatDate(this.session.time?.updated),
       ]
@@ -6637,6 +6702,9 @@ class SessionChatView extends ItemView {
       return;
     }
     if (this.unsubscribed) return;
+    // Kept for the context-usage header: model entries carry limit.context.
+    this.models = models;
+    this.renderHeader();
     const select = this.modelSelect;
     select.empty();
 
@@ -6984,6 +7052,7 @@ class SessionChatView extends ItemView {
       this.cursorOlder = cursorOlder;
     }
     this.olderButton.style.display = this.cursorOlder ? "" : "none";
+    this.recomputeContextUsage();
   }
 
   // Creates or updates a message element. Returns the message record.
@@ -7024,8 +7093,10 @@ class SessionChatView extends ItemView {
   }
 
   stableMessage(message) {
-    const { id, type, time, text, agent, model, content, error, finish } = message;
-    return { id, type, time, text, agent, model, content, error, finish };
+    // `tokens` participates in the diff: a listing that only adds the final
+    // usage must still refresh the record (the context-usage header reads it).
+    const { id, type, time, text, agent, model, content, error, finish, tokens } = message;
+    return { id, type, time, text, agent, model, content, error, finish, tokens };
   }
 
   // ----- pending inbox (spec/010) ---------------------------------------------
@@ -8385,6 +8456,26 @@ class SessionChatView extends ItemView {
         }
         record.stepTokensEl.setText(` · ${tokens} tok`);
       }
+      // The finished step's usage IS the context footprint — adopt it for
+      // the header (TUI parity) without waiting for the next reconcile.
+      this.contextTokens = data.tokens;
+      this.contextModel = record.msg?.model || this.contextModel;
+      this.renderHeader();
+    }
+  }
+
+  // Newest-first scan of loaded records: the last assistant step with usage
+  // is the session's context footprint. Runs after listing ingestion; live
+  // steps cover the gaps via finalizeStep.
+  recomputeContextUsage() {
+    for (let i = this.order.length - 1; i >= 0; i--) {
+      const record = this.messages.get(this.order[i]);
+      const tokens = record?.msg?.tokens;
+      if (record?.msg?.type === "assistant" && tokens && sumTokens(tokens) > 0) {
+        this.contextTokens = tokens;
+        this.contextModel = record.msg.model || this.contextModel;
+        return;
+      }
     }
   }
 
@@ -8419,6 +8510,7 @@ class SessionChatView extends ItemView {
       for (const message of [...listed].reverse()) {
         this.upsertMessage(message);
       }
+      this.recomputeContextUsage();
       // Keep pending-inbox state honest (missed delivered/cancelled events
       // during an SSE gap resolve here); the listing disambiguates.
       await this.refreshInbox(new Set(listed.map((message) => message.id))).catch(() => {});

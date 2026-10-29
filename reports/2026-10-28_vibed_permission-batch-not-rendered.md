@@ -3,6 +3,18 @@
 Date: 2026-10-28 · Status: fixed in main.js; superseded by spec/011 for the
 subagent case (v0.21.0, same day — see below)
 
+## Follow-up (v0.21.1): context-window usage, TUI parity
+
+The header showed cumulative session tokens ("26,917,111 tokens") where the
+TUI shows the live context footprint ("283.2K (28%)"). Cumulative stays, and
+the header now leads with TUI-parity context usage: the last completed
+assistant step's token sum (input+output+reasoning+cache read+write — the
+upstream `contextUsage` formula) against the model's `limit.context` from
+the picker's model list. Rendered as `187.7K (19%) · 26.5M total` with exact
+figures in the tooltip; live via `session.step.ended`, rehydrated from
+listings (`stableMessage` now diffs `tokens` so records pick up final usage).
+Dashboard token labels switched to the same compact format.
+
 ## Follow-up (v0.21.0): subagent asks on the parent thread
 
 After reload Roman identified the case the 0.20.1 fix did NOT cover: asks
