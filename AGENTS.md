@@ -62,7 +62,8 @@ object; `#` lines are comments.
 - **Dashboard options:** `connector` (name; omit = default), `dirs` (list;
   `~` expands locally, trailing `/*` = subtree), `basedir`, `sessions` (id
   list → clean pinned widget), `tags` (list; sessions whose note carries
-  all), `layout` (`cards`|`table`), `pageSize`, `title`.
+  all), `archived` (true — include archived sessions, hidden by default),
+  `layout` (`cards`|`table`), `pageSize`, `title`.
 - **Session config, ephemeral:** `model` (`provider/model[#variant]`),
   `agent`, `permissions`, `environment` — prefill/create-time only.
 - **Session config, root state:** `skills` (sources or `{id, install}`),

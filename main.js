@@ -26,6 +26,7 @@ const STATE_LABELS = {
   running: "Running…",
   delegating: "Subagents running",
   suspended: "Suspended",
+  archived: "Archived",
   idle: "Idle",
   waiting: "Needs approval",
   question: "Needs answer",
@@ -861,6 +862,7 @@ const VIBED_BLOCK_KEYS = [
   { key: "basedir", detail: "Prefix for relative dirs; cards show paths relative to it" },
   { key: "sessions", detail: "Explicit session ids (list) — renders a clean pinned widget" },
   { key: "tags", detail: "Only sessions whose note carries all of these tags" },
+  { key: "archived", detail: "Include archived sessions (true) — hidden by default" },
   { key: "layout", detail: "cards (default) or table" },
   { key: "pageSize", detail: "Sessions per page (number)" },
   { key: "title", detail: "Optional heading above the dashboard" },
@@ -883,6 +885,12 @@ function normalizeTagList(value) {
   return [...new Set(source.map((tag) => String(tag || "").trim()).filter(Boolean))];
 }
 
+// Boolean block flags arrive as real booleans (JSON config) or bare words
+// (`archived: true` in the simple format parses to the string "true").
+function blockFlag(value) {
+  return value === true || value === 1 || String(value).toLowerCase() === "true";
+}
+
 // Composes a vibed block body (simple `key: value` format) from a config
 // object. Only keys with content are emitted — blocks stay minimal; lists
 // become `key:` + indented `- item` lines. `extraLines` are appended
@@ -903,6 +911,7 @@ function composeVibedBlock(config = {}) {
   };
   scalar("connector", config.connector);
   scalar("basedir", config.basedir);
+  if (blockFlag(config.archived)) scalar("archived", "true");
   list("dirs", config.dirs);
   list("tags", normalizeTagList(config.tags));
   list("sessions", config.sessions);
@@ -990,7 +999,7 @@ skills:
   - ./skills/analysis
 \`\`\`
 
-**Options:** \`connector\` (name), \`dirs\` (list; \`~\` expands locally, a trailing \`/*\` matches the whole subtree), \`basedir\` (prefix for relative \`dirs\`), \`sessions\` (id list), \`tags\` (list — only sessions whose note carries all of them), \`layout\` (\`cards\`|\`table\`), \`pageSize\`, \`title\`.
+**Options:** \`connector\` (name), \`dirs\` (list; \`~\` expands locally, a trailing \`/*\` matches the whole subtree), \`basedir\` (prefix for relative \`dirs\`), \`sessions\` (id list), \`tags\` (list — only sessions whose note carries all of them), \`archived\` (true — include archived sessions, hidden by default), \`layout\` (\`cards\`|\`table\`), \`pageSize\`, \`title\`.
 
 **Session-config keys:** \`model\` (\`provider/model[#variant]\`), \`agent\`, \`permissions\`, \`environment\` (ephemeral — prefill/create-time only, never written to disk); \`skills\`, \`mcp\`, \`commands\`, \`agents\`, \`providers\`, \`references\`, \`default_agent\` (desired directory config, installed on consent). Never put secrets in blocks — use OpenCode's \`{env:VAR}\` substitution.
 
@@ -1666,14 +1675,16 @@ class OpenCodeClient {
   // default); follow cursor.next until exhausted so directory filtering —
   // including subtree globs — sees the whole tree, like the TUI does.
   // Each item: id, title, agent, model, cost, tokens, time{…},
-  // location{directory}.
-  async listSessions() {
+  // location{directory}. `archived=false` excludes archived sessions (the
+  // TUI default); omitting the param returns both (spec/012).
+  async listSessions(options = {}) {
     const pageSize = 500;
     const data = [];
     let cursor = null;
     // Hard cap (30k sessions) guards against a server that keeps paging.
     for (let page = 0; page < 60; page += 1) {
       const query = new URLSearchParams({ limit: String(pageSize) });
+      if (!options.includeArchived) query.set("archived", "false");
       if (cursor) query.set("cursor", cursor);
       const response = await this.request(`/api/session?${query.toString()}`, { timeoutMs: 20000 });
       const items = Array.isArray(response?.data) ? response.data : [];
@@ -2478,7 +2489,11 @@ class OpenCode2Driver extends ConnectorDriver {
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector, {
       expandHome: false,
     });
-    const response = await this.client.listSessions();
+    // Pinned-id lookups (allDirectories) must see archived rows too — an
+    // explicitly pinned session stays renderable after it is archived.
+    const response = await this.client.listSessions({
+      includeArchived: blockFlag(options.archived) || options.allDirectories === true,
+    });
     const list = Array.isArray(response?.data) ? response.data : [];
     const { exact: wanted, subtree } = splitDirGlobs(directories);
     const rows = list
@@ -2512,7 +2527,9 @@ class OpenCode2Driver extends ConnectorDriver {
         model: session.model || null,
         time_created: session.time?.created || null,
         time_updated: session.time?.updated || null,
-        time_archived: null,
+        // time.archived is exposed since v2.1.0; the suspend timestamp is
+        // not, so API rows never report "Suspended" (spec/012).
+        time_archived: session.time?.archived || null,
         time_suspended: null,
         version: null,
         cost: session.cost || 0,
@@ -2595,6 +2612,10 @@ class OpenCode2Driver extends ConnectorDriver {
       + " AND lm.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id)";
 
     if (customSql) clauses.push(`(${customSql})`);
+    // Archived sessions hide by default (TUI parity); the block-level
+    // `archived: true` flag opts in. Explicit id lookups bypass this method
+    // entirely, so pinned widgets keep showing archived sessions (spec/012).
+    if (!blockFlag(options.archived)) clauses.push(`${table}.time_archived IS NULL`);
     const rows = (await runSqlite(
       settings.sqlitePath,
       settings.databasePath,
@@ -4431,6 +4452,7 @@ class SessionsDashboard {
       basedir: this.options.basedir,
       dirs: this.options.dirs,
       tags,
+      archived: blockFlag(this.options.archived) ? "true" : "",
       layout: this.layout(),
       pageSize: this.options.pageSize,
       title: this.options.showSettings ? "" : this.options.title,
@@ -4602,6 +4624,7 @@ class SessionsDashboard {
         const rows = await driver.listSessions({
           dirs: this.options.dirs,
           basedir: this.options.basedir,
+          archived: blockFlag(this.options.archived),
         });
         // Pinned sessions lead; exclude them from the directory-driven list
         // so nothing shows up twice.
@@ -9883,6 +9906,10 @@ class VibedBlockSuggest extends EditorSuggest {
       push("table", "compact table rows", "table");
       return items;
     }
+    if (context.kind === "value" && context.key === "archived") {
+      push("true", "include archived sessions", "true");
+      return items;
+    }
     if (context.kind === "list" && context.key === "dirs") {
       const entry = context.connectorName
         ? this.plugin.registry.byName(context.connectorName)
@@ -9920,6 +9947,7 @@ class VibedInsertModal extends Modal {
       basedir: "",
       dirs: "",
       tags: "",
+      archived: false,
       sessions: "",
       pageSize: "",
       title: "",
@@ -9944,6 +9972,7 @@ class VibedInsertModal extends Modal {
         basedir: this.state.basedir,
         dirs: lineList(this.state.dirs),
         tags: this.state.tags,
+        archived: this.state.archived,
         sessions: lineList(this.state.sessions),
         layout: this.state.layout,
         pageSize: this.state.pageSize,
@@ -9990,6 +10019,16 @@ class VibedInsertModal extends Modal {
     field("basedir", "Base directory", "~/spaces");
     this.textArea("dirs", "Directories", "one per line (relative to basedir, ~/…, or absolute; trailing /* for subtrees)");
     this.textArea("tags", "Tags", "comma-separated — only sessions carrying all of them");
+    new Setting(contentEl)
+      .setName("Include archived")
+      .setDesc("Show archived sessions (hidden by default, like the TUI session list)")
+      .addToggle((toggle) => {
+        toggle.setValue(blockFlag(this.state.archived));
+        toggle.onChange((value) => {
+          this.state.archived = value;
+          this.renderPreview();
+        });
+      });
     this.textArea("sessions", "Session IDs", "one per line — fills only `sessions:` for a clean pinned widget");
     field("pageSize", "Page size", "");
     field("title", "Title", "");
@@ -10938,7 +10977,10 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     if (driver?.streamConnected()) {
       const live = driver.getLiveState(row.id);
       const status = live ? live.status : "idle";
-      if (status === "idle" && row.time_suspended) return "suspended";
+      if (status === "idle") {
+        if (row.time_archived) return "archived";
+        if (row.time_suspended) return "suspended";
+      }
       return status;
     }
     // Fallback: infer from the database.
@@ -10955,6 +10997,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     ) {
       return "running";
     }
+    if (row.time_archived) return "archived";
     if (row.time_suspended) return "suspended";
     return "idle";
   }
@@ -10981,6 +11024,8 @@ const LIST_REFRESH_EVENTS = new Set([
   "session.status",
   "session.idle",
   "session.renamed",
+  "session.archived",
+  "session.unarchived",
   "session.usage.updated",
   "session.inbox.enqueued",
   "session.inbox.delivered",

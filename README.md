@@ -168,6 +168,7 @@ Options (simple `key: value` lines or a JSON object):
 | `sessions` | – | Explicit session ids (list). With **only** `sessions` the block renders a clean widget: just the cards, no toolbar. Missing ids render as dashed "(not found)" cards. |
 | `basedir` | – | Prefix for relative `dirs`; cards/tables show directories relative to it. |
 | `tags` | – | Only sessions whose note carries **all** of these tags (list or comma string; intersected with `dirs`). |
+| `archived` | `false` | Include archived sessions (`true`). Hidden by default, matching the TUI session list; `opencode run --archived` CI sessions stay out of dashboards until you opt in. Combine with the `is:archived` filter to show *only* archived ones. |
 | `layout` | `cards` | `cards` or `table`. |
 | `pageSize` | plugin setting | Sessions per page. |
 | `title` | – | Optional heading above the dashboard. |

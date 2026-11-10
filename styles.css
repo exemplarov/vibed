@@ -136,7 +136,8 @@
 }
 
 .opencode-sessions-state-idle,
-.opencode-sessions-state-none {
+.opencode-sessions-state-none,
+.opencode-sessions-state-archived {
   color: var(--text-faint);
 }
 
@@ -461,7 +462,8 @@
 }
 
 .opencode-sessions-badge-idle,
-.opencode-sessions-badge-none {
+.opencode-sessions-badge-none,
+.opencode-sessions-badge-archived {
   color: var(--text-faint);
   background: var(--background-modifier-hover);
 }
@@ -1705,6 +1707,10 @@
 .opencode-sessions-sub-error .opencode-sessions-sub-dot,
 .opencode-sessions-sub-interrupted .opencode-sessions-sub-dot {
   background: var(--color-red);
+}
+
+.opencode-sessions-sub-archived .opencode-sessions-sub-dot {
+  background: var(--text-faint);
 }
 
 .opencode-sessions-sub-title {
