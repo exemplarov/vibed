@@ -92,6 +92,8 @@ already handled.
 
 ## 4. Model picker hides non-chat models
 
+Status: implemented
+
 Upstream: model `type` is optional on `Model.Info`; **unset means chat**;
 "Only chat models are offered for sessions". Since v2.2.2 image models are
 in the catalog by default.

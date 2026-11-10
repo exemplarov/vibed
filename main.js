@@ -6775,6 +6775,10 @@ class SessionChatView extends ItemView {
     const byProvider = new Map();
     for (const model of models) {
       if (!model?.id || !model?.providerID) continue;
+      // Only chat models can run a session (upstream: "an unset type means
+      // chat"); image/decision models — in the catalog by default since
+      // image_generate ships enabled — stay out of the picker (spec/012 §4).
+      if (model.type && model.type.toLowerCase() !== "chat") continue;
       if (!byProvider.has(model.providerID)) byProvider.set(model.providerID, []);
       byProvider.get(model.providerID).push(model);
     }
