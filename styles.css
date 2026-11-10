@@ -1460,6 +1460,15 @@
   margin-top: 0.25rem;
 }
 
+/* External elicitation fields: the URL to open (MCP OAuth-style flows). */
+.oc-question-url {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-size: var(--font-smaller);
+  word-break: break-all;
+  cursor: pointer;
+}
+
 .oc-question-actions {
   display: flex;
   gap: 0.5rem;

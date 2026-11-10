@@ -41,6 +41,13 @@ gets *both*).
 
 ## 2. MCP elicitation forms
 
+Status: implemented
+
+Notes: `normalizeForms` also passes `placeholder` (string fields) through to
+the custom-answer input. The reply target pins the directory captured at
+poll time; pre-2.1.4 servers latch off the global route on first 404 so the
+probe never repeats.
+
 Upstream v2.1.4: MCP servers can ask for input mid-tool-call via forms.
 Field schema (packages/schema/src/form.ts): `string` (+`format`
 email/uri/date/date-time, optional `options`, `custom`), `number`,

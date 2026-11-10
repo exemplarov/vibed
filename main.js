@@ -1778,31 +1778,38 @@ class OpenCodeClient {
   // Released v2 servers surface the question tool through the form API:
   // GET /api/session/:id/form + reply/cancel. The question arrives as a
   // form with fields q0, q1, … (answers keyed by field).
+  //
+  // MCP elicitation forms (v2.1.4+) are Location-owned and live under the
+  // reserved session id "global": those routes need the directory as a
+  // location[directory] query param (spec/012 §2).
 
-  sessionForms(sessionId) {
-    return this.request(`/api/session/${encodeURIComponent(sessionId)}/form`);
+  sessionForms(sessionId, directory) {
+    const suffix = directory ? this.locationQuery(directory) : "";
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/form${suffix}`);
   }
 
-  replyForm(sessionId, formId, answer) {
+  replyForm(sessionId, formId, answer, directory) {
+    const suffix = directory ? this.locationQuery(directory) : "";
     return this.request(
-      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/reply`,
+      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/reply${suffix}`,
       { method: "POST", body: { answer } },
     );
   }
 
-  cancelForm(sessionId, formId) {
+  cancelForm(sessionId, formId, directory) {
+    const suffix = directory ? this.locationQuery(directory) : "";
     return this.request(
-      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/cancel`,
+      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/cancel${suffix}`,
       { method: "POST" },
     );
   }
 
   // Pending question batches normalized to one shape:
   // { protocol, id, sessionID, title, questions: [{ key, header, question,
-  //   multiple, boolean, numeric, external, custom,
+  //   multiple, boolean, numeric, external, url, format, custom,
   //   options: [{ label, value, description }] }] }
-  async pendingQuestions(sessionId) {
-    return this.normalizeForms(await this.sessionForms(sessionId));
+  async pendingQuestions(sessionId, directory) {
+    return this.normalizeForms(await this.sessionForms(sessionId, directory));
   }
 
   normalizeForms(response) {
@@ -1819,6 +1826,11 @@ class OpenCodeClient {
         boolean: field.type === "boolean",
         numeric: field.type === "number" || field.type === "integer",
         external: field.type === "external",
+        // External fields carry a URL to open (MCP elicitation/OAuth-ish
+        // flows); string fields may declare a format (email/uri/date/…).
+        url: field.url || "",
+        format: field.format || "",
+        placeholder: field.placeholder || "",
         custom: field.custom !== false,
         options: (field.options || []).map((option) => ({
           label: option.label ?? option.value,
@@ -1831,19 +1843,19 @@ class OpenCodeClient {
 
   // Submits normalized answers (question key -> option value(s), custom text,
   // boolean, or number) keyed by form field.
-  async replyPendingQuestions(sessionId, pending, answers) {
+  async replyPendingQuestions(sessionId, pending, answers, directory) {
     const answer = {};
     for (const question of pending.questions) {
       // External fields are an acknowledgement (OAuth/integration flows):
       // the server requires the literal `true` on reply — Submit grants it.
       answer[question.key] = question.external ? true : answers.get(question.key);
     }
-    return this.replyForm(sessionId, pending.id, answer);
+    return this.replyForm(sessionId, pending.id, answer, directory);
   }
 
   // Rejects a pending batch: the tool call fails and the session continues.
-  async dismissPendingQuestions(sessionId, pending) {
-    return this.cancelForm(sessionId, pending.id);
+  async dismissPendingQuestions(sessionId, pending, directory) {
+    return this.cancelForm(sessionId, pending.id, directory);
   }
 
   // `delivery` defaults to "steer" server-side (injected at the next step
@@ -6216,7 +6228,11 @@ class SessionChatView extends ItemView {
     } else if (this.pendingPermission) {
       this.hintEl.setText("Waiting for your approval — the session is paused");
     } else if (this.pendingQuestion) {
-      this.hintEl.setText("Waiting for your answer — the session is paused");
+      this.hintEl.setText(
+        this.pendingQuestion.sessionID === "global"
+          ? "An MCP server asks for input — the session keeps running"
+          : "Waiting for your answer — the session is paused",
+      );
     } else if (this.descendantAsks.length || this.descendantQuestionIds.size) {
       this.hintEl.setText("A subagent is waiting on you — see the banner below");
     } else if (this.isDraft()) {
@@ -6257,6 +6273,9 @@ class SessionChatView extends ItemView {
     let state;
     if (this.pendingPermission) {
       state = "waiting";
+    } else if (this.pendingQuestion?.sessionID === "global") {
+      // Location-owned elicitation — the session's own state stands.
+      state = this.busy ? "running" : live && live.status !== "running" ? live.status : "idle";
     } else if (this.pendingQuestion) {
       state = "question";
     } else if (this.descendantAsks.length) {
@@ -7822,8 +7841,12 @@ class SessionChatView extends ItemView {
         break;
       case "form.created":
         // Released v2 servers surface the question tool as a form
-        // (metadata.kind === "question").
-        if (data.form?.sessionID && data.form.sessionID !== this.sessionId) {
+        // (metadata.kind === "question"). "global" forms are Location-owned
+        // MCP elicitations (spec/012 §2) — they apply to this session's
+        // location, so re-poll instead of rendering a subagent banner.
+        if (data.form?.sessionID === "global") {
+          this.refreshPendingQuestion().catch(() => {});
+        } else if (data.form?.sessionID && data.form.sessionID !== this.sessionId) {
           this.addDescendantQuestion(data.form.sessionID);
         } else {
           this.setPendingQuestion(this.driver?.client?.normalizeForms({ data: [data.form] })[0] || null);
@@ -7831,7 +7854,10 @@ class SessionChatView extends ItemView {
         break;
       case "form.replied":
       case "form.cancelled":
-        if (data.sessionID && data.sessionID !== this.sessionId) {
+        if (data.sessionID === "global") {
+          // Answered anywhere (TUI, desktop, another tab) — clear it here.
+          if (this.pendingQuestion?.sessionID === "global") this.clearPendingQuestion(data.id);
+        } else if (data.sessionID && data.sessionID !== this.sessionId) {
           this.removeDescendantQuestion(data.sessionID);
         } else {
           this.clearPendingQuestion(data?.id);
@@ -8084,7 +8110,9 @@ class SessionChatView extends ItemView {
 
   setPendingQuestion(pending) {
     if (!pending?.id || !this.sessionId) return;
-    if (pending.sessionID && pending.sessionID !== this.sessionId) return;
+    // "global" forms are Location-owned MCP elicitations (spec/012 §2) —
+    // they belong to every session of that location, including this one.
+    if (pending.sessionID && pending.sessionID !== this.sessionId && pending.sessionID !== "global") return;
     // Same batch already rendered: re-rendering would steal focus from the
     // custom-answer inputs and wipe typed-but-unapplied multi-select text.
     if (this.pendingQuestion?.id === pending.id) return;
@@ -8097,34 +8125,64 @@ class SessionChatView extends ItemView {
   clearPendingQuestion(questionId) {
     if (!this.pendingQuestion) return;
     if (questionId && this.pendingQuestion.id !== questionId) return;
+    const wasGlobal = this.pendingQuestion.sessionID === "global";
     this.pendingQuestion = null;
     this.questionAnswers.clear();
     this.questionOptionButtons = null;
     this.questionCustomEls = null;
     this.questionSubmitButton = null;
     // The batch is gone — a stale driver-side "question" state (answer made
-    // elsewhere while the event stream was down) must not outlive it.
-    this.driver?.clearLiveStatus?.(this.sessionId, "question");
+    // elsewhere while the event stream was down) must not outlive it. A
+    // global elicitation says nothing about THIS session's live state.
+    if (!wasGlobal) this.driver?.clearLiveStatus?.(this.sessionId, "question");
     this.renderQuestionBanner();
     this.renderBadge();
     this.updateComposer();
   }
 
   // Recovers a pending question batch on view open / refresh (a session
-  // that was already waiting, or an answer made while reconnecting).
+  // that was already waiting, or an answer made while reconnecting), and
+  // polls the location's MCP elicitations ("global" forms) — those never
+  // arrive through this session's event stream, so polling is their only
+  // delivery path besides the plugin's global fan-out (spec/012 §2).
   async refreshPendingQuestion() {
     if (!this.sessionId || this.offline || !this.driver) return;
     if (!this.driverCapabilities().questions) return;
+    let pending = null;
     try {
-      const pending = (await this.driver.client.pendingQuestions(this.sessionId))[0] || null;
-      if (this.unsubscribed) return;
-      if (pending) {
-        this.setPendingQuestion(pending);
-      } else if (this.pendingQuestion) {
-        this.clearPendingQuestion();
-      }
+      pending = (await this.driver.client.pendingQuestions(this.sessionId))[0] || null;
     } catch {
       // server hiccup — the event stream keeps us informed anyway
+    }
+    if (this.unsubscribed) return;
+    if (!pending) {
+      const directory = this.session?.location?.directory || "";
+      const client = this.driver.client;
+      if (directory && !client.globalFormsUnsupported && typeof client.sessionForms === "function") {
+        try {
+          const forms = await client.pendingQuestions("global", directory);
+          if (this.unsubscribed) return;
+          // Stamp the reserved owner so submit/dismiss route back to
+          // "global", and pin the location captured at poll time.
+          pending = (forms || [])[0] || null;
+          if (pending) {
+            pending.sessionID = "global";
+            pending.directory = directory;
+          }
+        } catch (error) {
+          // Older servers without the undocumented global route — latch so
+          // the guaranteed 404 stops repeating on every refresh.
+          if (/^40[45]/.test(String(error.message))) client.globalFormsUnsupported = true;
+        }
+      }
+    }
+    if (pending) {
+      // A question that arrived while the global poll was in flight wins —
+      // it blocks this session; the elicitation doesn't.
+      if (pending.sessionID === "global" && this.pendingQuestion) return;
+      this.setPendingQuestion(pending);
+    } else if (this.pendingQuestion) {
+      this.clearPendingQuestion();
     }
   }
 
@@ -8137,12 +8195,19 @@ class SessionChatView extends ItemView {
       return;
     }
     const { title, questions } = this.pendingQuestion;
+    const elicitation = this.pendingQuestion.sessionID === "global";
     banner.style.display = "";
     const head = banner.createDiv({ cls: "oc-question-head" });
-    setIcon(head.createSpan({ cls: "oc-question-icon" }), "help-circle");
+    setIcon(head.createSpan({ cls: "oc-question-icon" }), elicitation ? "plug" : "help-circle");
     head.createSpan({
       cls: "oc-question-title",
-      text: title && title !== "Questions" ? `Agent asks — ${title}` : "Agent asks — answer to continue",
+      text: elicitation
+        ? title && title !== "Questions"
+          ? `MCP server asks — ${title}`
+          : "MCP server asks — answer to continue"
+        : title && title !== "Questions"
+          ? `Agent asks — ${title}`
+          : "Agent asks — answer to continue",
     });
     this.questionOptionButtons = new Map();
     this.questionCustomEls = new Map();
@@ -8169,6 +8234,20 @@ class SessionChatView extends ItemView {
       field.createDiv({ cls: "oc-question-text", text: question.question });
     }
     if (question.external) {
+      // External fields carry a URL to open in the system browser (MCP
+      // elicitation/OAuth-style requests); Submit acknowledges, Dismiss
+      // cancels (spec/012 §2).
+      if (question.url) {
+        const link = field.createEl("a", {
+          cls: "oc-question-url",
+          text: question.url,
+          attr: { href: question.url, target: "_blank", rel: "noopener noreferrer" },
+        });
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          if (typeof window !== "undefined" && window.open) window.open(question.url, "_blank");
+        });
+      }
       field.createDiv({
         cls: "oc-question-external",
         text: "This input is answered from another surface; Submit acknowledges it here, Dismiss cancels.",
@@ -8225,9 +8304,11 @@ class SessionChatView extends ItemView {
         type: "text",
         cls: "oc-question-custom",
         attr: {
-          placeholder: question.multiple
-            ? "Add your own answer (Enter to add)…"
-            : "Or type your own answer…",
+          placeholder:
+            question.placeholder ||
+            (question.multiple
+              ? "Add your own answer (Enter to add)…"
+              : "Or type your own answer…"),
           spellcheck: "false",
         },
       });
@@ -8316,15 +8397,35 @@ class SessionChatView extends ItemView {
     this.questionSubmitButton.disabled = !complete;
   }
 
+  // Reply target for the pending batch: the session's own form, or the
+  // reserved "global" id for Location-owned MCP elicitations, which also
+  // needs the directory as a location query. The directory is pinned at
+  // poll time — this.session may be stale by submit (spec/012 §2).
+  questionTarget() {
+    if (this.pendingQuestion?.sessionID === "global") {
+      return { sessionId: "global", directory: this.pendingQuestion.directory || "" };
+    }
+    return { sessionId: this.sessionId, directory: "" };
+  }
+
   async submitQuestion() {
     const pending = this.pendingQuestion;
     if (!pending || this.replyingQuestion) return;
     this.replyingQuestion = true;
     if (this.questionSubmitButton) this.questionSubmitButton.disabled = true;
+    const target = this.questionTarget();
     try {
-      await this.driver.client.replyPendingQuestions(this.sessionId, pending, this.questionAnswers);
+      await this.driver.client.replyPendingQuestions(
+        target.sessionId,
+        pending,
+        this.questionAnswers,
+        target.directory || undefined,
+      );
       this.clearPendingQuestion(pending.id);
       new Notice("Answer sent — the session continues");
+      // A location may hold several queued elicitations; the next one only
+      // surfaces through this re-poll (their events are unreliable).
+      if (pending.sessionID === "global") this.refreshPendingQuestion().catch(() => {});
     } catch (error) {
       // Answered or dismissed elsewhere (TUI, another tab): 404/409 — clear.
       if (/^40[49]/.test(String(error.message))) {
@@ -8344,8 +8445,9 @@ class SessionChatView extends ItemView {
     const pending = this.pendingQuestion;
     if (!pending || this.replyingQuestion) return;
     this.replyingQuestion = true;
+    const target = this.questionTarget();
     try {
-      await this.driver.client.dismissPendingQuestions(this.sessionId, pending);
+      await this.driver.client.dismissPendingQuestions(target.sessionId, pending, target.directory || undefined);
       this.clearPendingQuestion(pending.id);
       new Notice("Questions dismissed — the tool call was rejected");
     } catch (error) {
@@ -10430,6 +10532,20 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       return;
     }
     const sessionId = data.sessionID || (type === "form.created" ? data.form?.sessionID : undefined);
+    // "global" is the reserved owner of Location-scoped MCP elicitation
+    // forms (spec/012 §2): not a real session, so it never gets live state
+    // or session listeners — instead every open chat view of this driver
+    // re-polls its location's forms.
+    if (sessionId === "global") {
+      if (type.startsWith("form.")) {
+        for (const view of this.openSessionViews()) {
+          if (view.driver === driver && typeof view.refreshPendingQuestion === "function") {
+            view.refreshPendingQuestion().catch(() => {});
+          }
+        }
+      }
+      return;
+    }
     driver.applyLiveEvent(type, sessionId);
     if (!sessionId) return;
     const listeners = this.sessionListeners.get(`${driver.connector.id}:${sessionId}`);
