@@ -72,6 +72,8 @@ reply/cancel routes — form-location middleware).
 
 ## 3. Session rename + archive actions
 
+Status: implemented
+
 Upstream: `PATCH /api/session/:id` with `{title?, metadata?, permissions?,
 archived?}` → 204 (verb verified live; PUT/POST 404). Events
 `session.archived` / `session.unarchived` exist; `session.renamed` is
@@ -80,12 +82,13 @@ already handled.
 - Client: `updateSession(sessionId, {title?, archived?})` — PATCH, no
   dialect probe needed (404 vs 405 was empirically unambiguous, and older
   v2 servers that lack it simply 404 → notice).
-- Chat header ⋮ menu gains: **Rename…** (modal, empty submit disabled;
-  server regenerates when vibed sends a non-empty title), **Archive** /
-  **Unarchive** (toggled by current `time.archived` state).
+- Chat header ⋮ menu gains: **Rename…** (modal; an empty title asks the
+  server to regenerate it — falsy title → `title.generate` →
+  `session.renamed`, verified upstream), **Archive** / **Unarchive**
+  (toggled by current `time.archived` state, re-read at click time).
 - `session.archived`/`session.unarchived` join `LIST_REFRESH_EVENTS`;
   archived event also flips the local row so open views update without a
-  refetch.
+  refetch. The chat badge shows "Archived" when the live state is idle.
 
 ## 4. Model picker hides non-chat models
 

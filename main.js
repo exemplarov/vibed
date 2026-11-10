@@ -1729,6 +1729,17 @@ class OpenCodeClient {
     });
   }
 
+  // Partial session update (v2.1.0+): `{title?, archived?}` → 204. An empty
+  // title asks the server to regenerate one. PATCH is the only verb (PUT/
+  // POST 404 — verified against a live v2.2 server, spec/012 §3); older
+  // servers that predate an endpoint answer 404 and the caller notices.
+  updateSession(sessionId, fields = {}) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH",
+      body: fields,
+    });
+  }
+
   agents(directory) {
     return this.request(`/api/agent${this.locationQuery(directory)}`);
   }
@@ -6293,8 +6304,11 @@ class SessionChatView extends ItemView {
         : live.status !== "running"
           ? live.status
           : "idle";
+      // Archived outranks plain idle — same precedence as the dashboard's
+      // sessionState() (spec/012 §1/§3).
+      if (state === "idle" && this.session?.time?.archived) state = "archived";
     } else {
-      state = "idle";
+      state = this.session?.time?.archived ? "archived" : "idle";
     }
     this.badgeEl.className = `opencode-sessions-badge opencode-sessions-badge-${state}`;
     this.badgeEl.setText(STATE_LABELS[state] || "");
@@ -6968,12 +6982,30 @@ class SessionChatView extends ItemView {
   showHeaderMenu(event) {
     const menu = new Menu();
     const draft = this.isDraft();
+    const client = this.driver?.client;
+    const canUpdate = !draft && !!this.sessionId && typeof client?.updateSession === "function";
     menu.addItem((item) =>
       item
         .setTitle("Copy ID")
         .setIcon("copy")
         .setDisabled(draft || !this.sessionId)
         .onClick(() => copyTextToClipboard(this.sessionId, "Copied session ID")),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Rename…")
+        .setIcon("pencil")
+        .setDisabled(!canUpdate)
+        .onClick(() => this.promptRename()),
+    );
+    const archived = !!this.session?.time?.archived;
+    menu.addItem((item) =>
+      item
+        .setTitle(archived ? "Unarchive" : "Archive")
+        .setIcon(archived ? "archive-restore" : "archive")
+        .setDisabled(!canUpdate)
+        // Re-read at click time — the state may flip while the menu is open.
+        .onClick(() => this.setSessionArchived(!this.session?.time?.archived, client)),
     );
     menu.addItem((item) =>
       item
@@ -6984,6 +7016,71 @@ class SessionChatView extends ItemView {
     );
     appendDirectoryMenuItems(menu, this.session?.location?.directory || this.draftDirectory || "");
     menu.showAtMouseEvent(event);
+  }
+
+  // Rename via PATCH /api/session/:id (spec/012 §3). An empty title asks
+  // the server to regenerate one; the header follows the session.renamed
+  // event, with a local fallback while offline.
+  promptRename() {
+    const client = this.driver?.client;
+    if (!this.sessionId || typeof client?.updateSession !== "function") return;
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("Rename session");
+    modal.contentEl.addClass("vibed-rename-modal");
+    const input = modal.contentEl.createEl("input", {
+      type: "text",
+      cls: "oc-id-input",
+      attr: { placeholder: "New title — empty regenerates it", spellcheck: "false" },
+    });
+    input.value = this.session?.title || "";
+    let submitting = false;
+    const submit = async () => {
+      if (submitting) return;
+      submitting = true;
+      const title = input.value.trim();
+      try {
+        // Empty title asks the server to regenerate (verified upstream:
+        // falsy title → title.generate → session.renamed).
+        await client.updateSession(this.sessionId, { title });
+        if (this.session) this.session.title = title || this.session.title;
+        this.renderHeader();
+        new Notice(title ? "Session renamed" : "Title regeneration requested");
+      } catch (error) {
+        new Notice(`Rename failed: ${error.message}`);
+      } finally {
+        modal.close();
+      }
+    };
+    input.addEventListener("keydown", (keydownEvent) => {
+      if (keydownEvent.key === "Enter" && !keydownEvent.shiftKey && !keydownEvent.isComposing) {
+        keydownEvent.preventDefault();
+        submit();
+      }
+    });
+    modal.contentEl.createEl("button", { cls: "mod-cta", text: "Rename" }).addEventListener("click", submit);
+    modal.onOpen = () => input.focus();
+    modal.open();
+  }
+
+  async setSessionArchived(archived, client = this.driver?.client) {
+    if (!this.sessionId || typeof client?.updateSession !== "function") return;
+    try {
+      await client.updateSession(this.sessionId, { archived });
+      if (this.session) {
+        this.session.time = { ...(this.session.time || {}) };
+        if (archived) this.session.time.archived = Date.now();
+        else delete this.session.time.archived;
+      }
+      this.renderHeader();
+      this.renderBadge();
+      new Notice(
+        archived
+          ? "Session archived — hidden from dashboards (archived: true shows it)"
+          : "Session unarchived",
+      );
+    } catch (error) {
+      new Notice(`${archived ? "Archive" : "Unarchive"} failed: ${error.message}`);
+    }
   }
 
   // Manual + automatic refresh entry points (⋮ menu, tab focus,
@@ -7057,7 +7154,11 @@ class SessionChatView extends ItemView {
             output: row.tokens_output,
             reasoning: row.tokens_reasoning,
           },
-          time: { created: row.time_created, updated: row.time_updated },
+          time: {
+            created: row.time_created,
+            updated: row.time_updated,
+            archived: row.time_archived ?? undefined,
+          },
           location: { directory: row.directory },
         };
       }
@@ -7726,6 +7827,17 @@ class SessionChatView extends ItemView {
           this.renderHeader();
         }
         this.titleEl.setText(data.title || this.titleEl.getText());
+        break;
+      case "session.archived":
+      case "session.unarchived":
+        // Archive flips made anywhere (this menu, the TUI, elsewhere).
+        if (this.session) {
+          this.session.time = { ...(this.session.time || {}) };
+          if (type === "session.archived") this.session.time.archived = event.created || Date.now();
+          else delete this.session.time.archived;
+          this.renderHeader();
+          this.renderBadge();
+        }
         break;
       case "session.usage.updated":
         if (this.session) {
