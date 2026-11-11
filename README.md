@@ -67,7 +67,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 
 ## Features
 
-- **In-app help**: a **?** toolbar button (and the *Open vibed help* command) opens a built-in quick-start page — the widget guide from minimal to niche, the filter language, and session-config keys, no README round-trip needed.
+- **In-app help**: a **?** toolbar button opens a menu — *Quick-start guide* (a wide modal with the widget guide from minimal to niche, the filter language, and session-config keys) plus the block-authoring commands. Also under the *Open vibed help* command. No README round-trip needed.
 - **Note-embedded dashboards** via a `vibed` code block (cards or table layout) — no other plugins required. Compact icon toolbar (filter, copy-as-block, refresh, help, new session) that keeps the top-right corner free for Obsidian's block-edit button; a filter that matches nothing leaves a one-card-tall empty state with a *Clear filter* escape hatch instead of collapsing the widget.
 - **Block authoring support**: a command palette form that inserts a new block (with live preview), autocomplete inside every `vibed` fence, and *Copy as vibed block* on dashboard toolbars. See [Authoring dashboards](#authoring-dashboards).
 - **Embedded agent reference**: one command writes/updates an AGENTS.md cheatsheet for AI sessions into any vault folder — vaults never hand-maintain their own copy.

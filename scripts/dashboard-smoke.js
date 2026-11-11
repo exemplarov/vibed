@@ -15,7 +15,7 @@ const obsidianLine = src.split("\n").find((l) => l.includes('require("obsidian")
 if (!obsidianLine) throw new Error("obsidian require not found in main.js");
 src = src.replace(
   obsidianLine,
-  `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class {}, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class {}, TFile = class {}, TFolder = class {} } = {};`,
+  `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class { constructor(app){ if (!app) throw new Error("Modal constructed without an App — pass plugin.app at the call site"); } open() {} }, Menu = class { constructor(){ (globalThis.__smokeMenus = globalThis.__smokeMenus || []).push(this); this.items = []; } addItem(fn){ const item = { _title: "", setTitle(t){ this._title = t; return this; }, setIcon(){ return this; }, setDisabled(){ return this; }, onClick(handler){ this._onClick = handler; return this; } }; if (fn) fn(item); this.items.push(item); return this; } addSeparator(){ return this; } showAtMouseEvent() {} }, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class { setPlaceholder() {} open() {} }, TFile = class {}, TFolder = class {} } = {};`,
 );
 src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, normalizeMcpList, normalizeCommandList, normalizeSkillList, normalizeInboxItem, inboxMessageFrom };`;
 
@@ -98,6 +98,7 @@ function makeEl(tag, opts = {}) {
     },
   };
   if (opts.text) el._text = String(opts.text);
+  if (opts.attr) el.attr = opts.attr;
   return el;
 }
 
@@ -119,6 +120,8 @@ const driver = {
 };
 const connector = { id: "c1", name: "opencode", kind: "opencode2", enabled: true };
 const plugin = {
+  // Toolbar-launched modals receive this via SessionsDashboard's app getter.
+  app: {},
   settings: { pageSize: 10, notesDir: "vibed-notes" },
   registry: {
     byName: () => ({ connector, driver }),
@@ -146,9 +149,11 @@ function findStatus(el) {
 }
 
 let failures = 0;
-const check = (name, fn) => {
+// Async fns must be awaited here: a rejected async check would otherwise
+// surface as an unhandled rejection after the summary line, not a FAIL.
+const check = async (name, fn) => {
   try {
-    fn();
+    await fn();
     console.log(`ok — ${name}`);
   } catch (error) {
     failures += 1;
@@ -171,6 +176,34 @@ const check = (name, fn) => {
     const dash = new SessionsDashboard(plugin, makeEl("div"), { sessions: ["ses_1"] });
     const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("load never settled")), 3000));
     await Promise.race([dash.mount(), timeout]);
+  });
+
+  // The toolbar's "?" button (spec/013): clicking must build the help menu,
+  // and every item's modal must receive a real App — the stubbed Modal
+  // throws otherwise. This is the regression shape where a call site used
+  // `this.app` on a class that only carries `plugin`.
+  await check("help button opens a menu whose modals get the App", async () => {
+    const menus = (globalThis.__smokeMenus = []);
+    const container = makeEl("div");
+    const dash = new SessionsDashboard(plugin, container, {});
+    dash.mount().catch(() => {});
+    const findButton = (el) => {
+      for (const child of el.children || []) {
+        if (child.tagName === "button" && child.attr && child.attr["aria-label"] === "Help and authoring") {
+          return child;
+        }
+        const deep = findButton(child);
+        if (deep) return deep;
+      }
+      return null;
+    };
+    const button = findButton(container);
+    if (!button) throw new Error("help button not found in the toolbar");
+    (button.listeners.click || []).forEach((fn) => fn({}));
+    const menu = menus.at(-1);
+    if (!menu) throw new Error("click did not open a menu");
+    if (!menu.items.length) throw new Error("menu has no items");
+    for (const item of menu.items) item._onClick(); // constructs modals — Modal stub asserts app
   });
 
   await check("filtered render with every criterion set", async () => {

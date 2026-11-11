@@ -1,4 +1,4 @@
-# spec/013 — In-app help page ("?" button)
+# spec/013 — In-app help ("?" button)
 
 Status: in progress
 
@@ -15,19 +15,20 @@ ordered simple → complex.
 
 - Icon-only toolbar button in `SessionsDashboard.mount()` (shared by the
   dedicated view and embedded blocks), placed **before** the "+ New
-  session" button and after Refresh. `help-circle` icon, `title: "How to
-  use vibed"`.
-- Opens the help page via `plugin.activateHelpView()`.
+  session" button and after Refresh. `help-circle` icon.
+- Opens a small **menu** (amendment v2 — no separate view): *Quick-start
+  guide* (primary), then the authoring commands *Insert session dashboard
+  block* and *Save AI agent reference (AGENTS.md)*.
 
-### Help page
+### Quick-start guide
 
-- New `VibedHelpView extends ItemView`, `VIEW_TYPE_HELP =
-  "vibed-help-view"`, icon `help-circle`, display text "Vibed help".
-- Renders one markdown constant (`VIBED_HELP_MD`) with
-  `MarkdownRenderer.render` on open.
-- `activateHelpView()` mirrors `activateView()`: reuse the existing help
-  leaf, else open in the right sidebar, then reveal.
-- Command: "Open vibed help" (id `open-help`).
+- Rendered from one markdown constant (`VIBED_HELP_MD`) inside a wide
+  scrollable **modal** (`VibedHelpModal`) — deliberately NOT a workspace
+  leaf: a help view would add a second vibed icon to the right sidebar,
+  and the plugin keeps exactly one sidebar presence (the sessions view).
+- Command "Open vibed help" (id `open-help`) opens the modal directly.
+- A draft of this spec shipped a `VibedHelpView` leaf; reverted per user
+  feedback before any release.
 
 ### Content (`VIBED_HELP_MD`)
 
@@ -36,7 +37,7 @@ User-facing guide, progressive complexity:
 1. What vibed is + the sessions view / ribbon.
 2. **Widgets quick-start** (the emphasis): a ```vibed fence in any note;
    examples as ```yaml fences (NOT ```vibed — the registered processor
-   would mount live dashboards inside the help page):
+   would mount live dashboards inside the guide):
    - minimal (zero keys)
    - `dirs` (most-used; `~` and `/*` subtrees)
    - `title`, `layout: table`, `pageSize`
@@ -55,7 +56,7 @@ User-facing guide, progressive complexity:
 8. Connectors + where to configure (Settings).
 
 Every section leads with a copy-pasteable snippet. No live dashboards
-inside the page.
+inside the guide.
 
 ## Out of scope
 

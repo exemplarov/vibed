@@ -9,7 +9,6 @@ const { execFile, spawn } = require("child_process");
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
 const VIEW_TYPE_NEW_SESSION = "opencode-new-session-view";
-const VIEW_TYPE_HELP = "vibed-help-view";
 const BLOCK_LANGUAGE = "vibed";
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
@@ -4608,6 +4607,12 @@ class SessionNotes {
 // ---------------------------------------------------------------------------
 
 class SessionsDashboard {
+  // Obsidian access for modals/menus launched from toolbar actions — the
+  // class itself only ever receives the plugin.
+  get app() {
+    return this.plugin.app;
+  }
+
   constructor(plugin, container, options = {}) {
     this.plugin = plugin;
     this.container = container;
@@ -4771,12 +4776,32 @@ class SessionsDashboard {
       toolButton(toolbar, "rotate-cw", "Refresh", "Refresh sessions").addEventListener("click", () =>
         this.load(),
       );
-      // Help (spec/013): the widget quick-start. Sits before "+" so the
-      // DSL doesn't require a README round-trip.
-      toolButton(toolbar, "help-circle", "How to use vibed", "Open the quick-start guide").addEventListener(
-        "click",
-        () => this.plugin.activateHelpView(),
-      );
+      // Help (spec/013): the widget quick-start, one menu deep — no
+      // separate leaf, so vibed keeps a single sidebar presence.
+      toolButton(toolbar, "help-circle", "Help and authoring", "Quick-start guide and authoring tools")
+        .addEventListener("click", (event) => {
+          const menu = new Menu();
+          menu.addItem((item) =>
+            item
+              .setTitle("Quick-start guide")
+              .setIcon("book-open")
+              .onClick(() => new VibedHelpModal(this.app, this.plugin).open()),
+          );
+          menu.addSeparator();
+          menu.addItem((item) =>
+            item
+              .setTitle("Insert session dashboard block")
+              .setIcon("plus")
+              .onClick(() => new VibedInsertModal(this.app, this.plugin).open()),
+          );
+          menu.addItem((item) =>
+            item
+              .setTitle("Save AI agent reference (AGENTS.md)")
+              .setIcon("file-code")
+              .onClick(() => new AgentReferenceFolderModal(this.app, this.plugin).open()),
+          );
+          menu.showAtMouseEvent(event);
+        });
       // New sessions need a drafts-capable connector (OpenCode v2) — the
       // dashboard's own connector, not whatever is globally default.
       let draftsCapable = false;
@@ -5548,8 +5573,7 @@ class SessionsDashboard {
 
 // Wraps a dashboard embedded in a note so it is cleaned up when the
 // rendered block leaves the DOM.
-class SessionsDashboardChild extends MarkdownRenderChild {
-  constructor(containerEl, plugin, options) {
+class SessionsDashboardChild extends MarkdownRenderChild {  constructor(containerEl, plugin, options) {
     super(containerEl);
     this.dashboard = plugin.createDashboard(containerEl, options);
   }
@@ -5563,30 +5587,20 @@ class SessionsDashboardChild extends MarkdownRenderChild {
   }
 }
 
-// Help page (spec/013): renders the in-app guide. Static by design — the
-// markdown constant carries yaml-fenced examples, never vibed fences, so
-// no live dashboard mounts inside the page.
-class VibedHelpView extends ItemView {
-  constructor(leaf, plugin) {
-    super(leaf);
+// Quick-start guide (spec/013). A wide modal, deliberately NOT a workspace
+// leaf: a help view would add a second vibed icon to the right sidebar,
+// and the plugin keeps exactly one sidebar presence (the sessions view).
+// Static by design — the markdown constant carries yaml-fenced examples,
+// never vibed fences, so no live dashboard mounts inside the guide.
+class VibedHelpModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
     this.plugin = plugin;
   }
 
-  getViewType() {
-    return VIEW_TYPE_HELP;
-  }
-
-  getDisplayText() {
-    return "Vibed help";
-  }
-
-  getIcon() {
-    return "help-circle";
-  }
-
   async onOpen() {
-    this.contentEl.empty();
-    this.contentEl.addClass("vibed-help-view");
+    this.titleEl.setText("Vibed quick start");
+    this.modalEl.addClass("vibed-help-modal");
     const body = this.contentEl.createDiv({ cls: "vibed-help-body" });
     await MarkdownRenderer.render(
       this.app,
@@ -10802,7 +10816,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
     this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
-    this.registerView(VIEW_TYPE_HELP, (leaf) => new VibedHelpView(leaf, this));
     // Note-embeddable dashboards: ```vibed blocks render the same
     // dashboard as the view, configured by the block body. A `connector:`
     // option selects a named connector; without it the default is used.
@@ -10825,7 +10838,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.addCommand({
       id: "open-help",
       name: "Open vibed help",
-      callback: () => this.activateHelpView(),
+      callback: () => new VibedHelpModal(this.app, this).open(),
     });
     this.addCommand({
       id: "new-session",
@@ -11181,17 +11194,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     if (!leaf) {
       leaf = this.app.workspace.getRightLeaf(false);
       await leaf.setViewState({ type: VIEW_TYPE_SESSIONS, active: true });
-    }
-    this.app.workspace.revealLeaf(leaf);
-  }
-
-  // Help page (spec/013): reuse the open help leaf, else open beside the
-  // sessions view in the right sidebar.
-  async activateHelpView() {
-    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_HELP)[0];
-    if (!leaf) {
-      leaf = this.app.workspace.getRightLeaf(false);
-      await leaf.setViewState({ type: VIEW_TYPE_HELP, active: true });
     }
     this.app.workspace.revealLeaf(leaf);
   }

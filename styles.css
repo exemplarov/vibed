@@ -2,13 +2,20 @@
   padding: 1rem;
 }
 
-/* Help page (spec/013): readable column, like a settings page. */
-.vibed-help-view {
-  padding: 1rem 0.75rem;
+/* Help modal (spec/013): a wide readable column, scrollable. */
+.vibed-help-modal {
+  width: min(46rem, 80vw);
+  height: min(44rem, 85vh);
+  padding-bottom: 0;
+}
+
+.vibed-help-modal .modal-content {
+  overflow-y: auto;
+  padding-bottom: 1.5rem;
 }
 
 .vibed-help-body {
-  max-width: 46rem;
+  max-width: 42rem;
   margin: 0 auto;
 }
 
