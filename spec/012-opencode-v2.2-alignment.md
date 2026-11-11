@@ -1,6 +1,6 @@
 # spec/012 — OpenCode v2.1–v2.2 API alignment
 
-Status: in progress
+Status: implemented
 
 Source: changelog audit 2026-11-09 (`reports/2026-11-09_vibed_opencode-changelog-audit.md`),
 verified against a live v2.2.x server (PATCH verb, `archived` query param,
@@ -105,15 +105,24 @@ in the catalog by default.
 
 ## 5. Tool output file blocks (incl. generated images)
 
+Status: implemented
+
 Upstream: tool `state.content` blocks are `text` or `file {uri, mime,
 name?}` (packages/schema/src/tool.ts). `image_generate` (default-on since
-v2.2.2) returns file blocks; vibed dropped everything but text.
+v2.2.2) returns file blocks; the `read` tool returns inline `data:` URIs —
+vibed dropped everything but text.
 
 - `renderToolOutput` renders `file` blocks:
   - `image/*` mime → inline `<img>`: `http(s)://` and `data:` uris used
-    directly; local paths via Obsidian's `app://local/` scheme (desktop
-    plugin). Broken/missing local files degrade to the chip.
-  - everything else (and non-previewable images) → chip with name/mime
-    and an open action (URLs in the system browser via `window.open`;
-    local paths via the existing spawn-based opener used for directories).
+    directly (data: capped at ~1.5 MB — decoding allocates the full
+    bitmap); local paths via Obsidian's `app://local/` scheme, resolved
+    against the session directory (relative paths without one stay
+    chip-only). Broken/missing local files degrade to the chip.
+  - everything else → chip with name/mime and an open action (URLs in
+    the system browser; local paths and `file:` URLs via the spawn-based
+    opener). `data:` blocks are chip-only — nothing on disk to open —
+    with a mime-derived label.
+- Stored output starts collapsed (a transcript full of auto-expanded
+  images would decode every bitmap on load); only the live streaming tail
+  auto-expands its Output details.
 - Styles: `.oc-tool-file` chip + img sizing in styles.css.

@@ -336,6 +336,76 @@ function openDirectoryInFileManager(directory) {
   spawnHelperBinary("xdg-open", [directory], `open ${directory} in the file manager`);
 }
 
+// Tool-output file blocks (spec/012 §5): remote URLs open in the system
+// browser; local paths (and file: URLs) in the default application —
+// open/explorer/xdg-open handle files exactly like directories. data:
+// URIs have nothing to open and are the caller's problem (chip-only).
+function openToolFileRef(uri) {
+  const target = String(uri || "").trim();
+  if (!target || /^data:/i.test(target)) return;
+  if (/^https?:/i.test(target)) {
+    if (typeof window !== "undefined" && window.open) window.open(target, "_blank");
+    return;
+  }
+  if (/^file:/i.test(target)) {
+    try {
+      openDirectoryInFileManager(require("url").fileURLToPath(target));
+    } catch {
+      // malformed file: URL — nothing sensible to open
+    }
+    return;
+  }
+  openDirectoryInFileManager(target);
+}
+
+// Chip label for a file block: the name when the tool sent one, else a
+// short derivation. data: URIs carry no path — the whole payload would
+// become the label — so derive from the mime type instead.
+function toolFileLabel(uri, mime) {
+  const text = String(uri || "").trim();
+  if (/^data:/i.test(text)) {
+    // data: URIs carry no usable path segment — derive from the mime.
+    const extension = String(mime || "").split("/")[1]?.split(";")[0];
+    return extension ? `attachment.${extension}` : "attachment";
+  }
+  const segment = text.split(/[\\/?#]/).filter(Boolean).pop();
+  return segment || "file";
+}
+
+// <img> source for an image file block: http(s)/data uris pass through;
+// local paths (absolute, or relative to the session directory) resolve via
+// Obsidian's app://local/ scheme — lazy, no base64 in the heap. Empty when
+// the reference can't be previewed; the caller keeps the plain chip.
+// Relative paths without a session directory stay unpreviewed on purpose —
+// resolving against the plugin's cwd would guess the wrong file.
+function toolFileImageSrc(uri, baseDirectory) {
+  const text = String(uri || "").trim();
+  if (!text) return "";
+  if (/^https?:/i.test(text)) return text;
+  if (/^data:/i.test(text)) {
+    // Inline data: preview only for modest payloads — decoding a huge
+    // base64 image allocates its full bitmap (~4 bytes/pixel) per block.
+    return text.length <= 1_500_000 ? text : "";
+  }
+  try {
+    const absolute = path.isAbsolute(text)
+      ? text
+      : baseDirectory
+        ? path.resolve(baseDirectory, text)
+        : "";
+    if (!absolute || !fs.existsSync(absolute)) return "";
+    const normalized = absolute.split(path.sep).join("/");
+    // app://local/ + the path without its leading slash; ? and # would
+    // otherwise terminate the URL early.
+    return `app://local/${encodeURI(normalized)
+      .replace(/^\//, "")
+      .replaceAll("?", "%3F")
+      .replaceAll("#", "%23")}`;
+  } catch {
+    return "";
+  }
+}
+
 // Linux terminal candidates: name → argv builder for the working directory.
 // Probed in order after an optional $TERMINAL override.
 const LINUX_TERMINALS = [
@@ -7533,13 +7603,60 @@ class SessionChatView extends ItemView {
     return { el: wrap, kind: "tool", nameEl, statusEl, inputEl, outputWrap, setInput, setStatus };
   }
 
-  renderToolOutput(wrap, content) {
+  renderToolOutput(wrap, content, options = {}) {
     wrap.empty();
     const details = wrap.createEl("details", { cls: "oc-tool-io" });
     details.createEl("summary", { text: "Output" });
+    let fileBlocks = 0;
     for (const block of content || []) {
       if (block?.type === "text") {
         details.createEl("pre", { cls: "oc-tool-output", text: String(block.text ?? "") });
+      } else if (block?.type === "file") {
+        fileBlocks += 1;
+        this.renderToolFileBlock(details, block);
+      }
+    }
+    // Auto-expanding every Output on transcript load would decode all
+    // inline images at once (loading=lazy only defers until intersection,
+    // and an open <details> intersects) — so only the live streaming tail
+    // expands; stored output starts collapsed like text (spec/012 §5).
+    if (fileBlocks && options.autoExpand) details.setAttribute("open", "");
+  }
+
+  // A file block from a tool result: {type: "file", uri, mime, name?} —
+  // e.g. image_generate output (default-on since OpenCode v2.2.2) and
+  // inline read results (data: URIs). Images preview inline when possible;
+  // everything renders as a chip, openable unless the payload is inline
+  // data (nothing on disk to open).
+  renderToolFileBlock(container, block) {
+    const uri = String(block.uri || "").trim();
+    const name = String(block.name || toolFileLabel(uri, block.mime));
+    const mime = String(block.mime || "");
+    const inlineData = /^data:/i.test(uri);
+    const chip = container.createDiv({ cls: "oc-tool-file" });
+    setIcon(chip.createSpan({ cls: "oc-tool-file-icon" }), mime.startsWith("image/") ? "image" : "file");
+    chip.createSpan({ cls: "oc-tool-file-name", text: name });
+    if (mime) chip.createSpan({ cls: "oc-tool-file-mime", text: mime });
+    if (!uri || inlineData) return;
+    const open = chip.createEl("button", {
+      cls: "oc-tool-file-open",
+      text: "Open",
+      // data: payloads aside, uris are paths/URLs — short enough to be a
+      // useful tooltip (truncated defensively for very long ones).
+      attr: { title: uri.length > 200 ? `${uri.slice(0, 200)}…` : uri },
+    });
+    open.addEventListener("click", () => openToolFileRef(uri));
+    if (mime.startsWith("image/")) {
+      const src = toolFileImageSrc(uri, this.session?.location?.directory);
+      if (src) {
+        const img = container.createEl("img", {
+          cls: "oc-tool-file-img",
+          attr: { src, alt: name, loading: "lazy" },
+        });
+        img.addEventListener("click", () => openToolFileRef(uri));
+        // Dead local reference (file moved/deleted, scheme mismatch) —
+        // drop the frame, the chip remains as the fallback.
+        img.addEventListener("error", () => img.remove());
       }
     }
   }
@@ -8680,7 +8797,9 @@ class SessionChatView extends ItemView {
         }
       } else {
         part.setStatus("done", "is-done");
-        if (Array.isArray(data.content)) this.renderToolOutput(part.outputWrap, data.content);
+        // Live completion at the streaming tail — expand so the fresh
+        // output (e.g. a generated image) is visible immediately.
+        if (Array.isArray(data.content)) this.renderToolOutput(part.outputWrap, data.content, { autoExpand: true });
       }
     });
   }

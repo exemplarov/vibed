@@ -1128,6 +1128,53 @@
   overflow-y: auto;
 }
 
+/* Tool-output file blocks (spec/012 §5). */
+.oc-tool-file {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.3rem 0 0;
+}
+
+.oc-tool-file-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+
+.oc-tool-file-name {
+  font-size: var(--font-smaller);
+  overflow-wrap: anywhere;
+}
+
+.oc-tool-file-mime {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.oc-tool-file-open {
+  font-size: var(--font-smallest);
+  padding: 0.1rem 0.5rem;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.oc-tool-file-open:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.oc-tool-file-img {
+  display: block;
+  max-height: 16rem;
+  max-width: 100%;
+  border-radius: var(--radius-s);
+  margin: 0.35rem 0 0.5rem;
+  cursor: pointer;
+}
+
 /* Find bar (Ctrl/Cmd+F): browser-style overlay on the transcript's
  * top-right corner. */
 .oc-findbar {
