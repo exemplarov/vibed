@@ -9,6 +9,7 @@ const { execFile, spawn } = require("child_process");
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
 const VIEW_TYPE_NEW_SESSION = "opencode-new-session-view";
+const VIEW_TYPE_HELP = "vibed-help-view";
 const BLOCK_LANGUAGE = "vibed";
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
@@ -1093,6 +1094,156 @@ function applyAgentReference(existing, section) {
   if (!text.trim()) return `${section}\n`;
   return `${text.replace(/\s+$/, "")}\n\n${section}\n`;
 }
+
+// ---------------------------------------------------------------------------
+// Help page (spec/013). One user-facing guide, rendered as markdown in a
+// dedicated view; examples use `yaml` fences on purpose — a `vibed` fence
+// here would mount a live dashboard inside the help page.
+// ---------------------------------------------------------------------------
+
+const VIBED_HELP_MD = `# Vibed quick start
+
+_Vibed ${AGENT_REFERENCE_VERSION_TOKEN}_ browses your AI coding-agent sessions inside Obsidian: **OpenCode v2** with live streaming and chat, plus read-only transcripts for OpenCode v1, Claude Code, Codex, and Cursor.
+
+Open the **OpenCode Sessions** view anytime from the ribbon (messages-square icon — two speech bubbles) or the command palette. Everything below lives in your notes.
+
+## Widgets — a dashboard in any note
+
+A widget is a code fence with the language \`vibed\`. Type it by hand, paste an example, or use the command palette → **Vibed: Insert session dashboard block** (a form with live preview). Autocomplete for keys and values works inside every \`vibed\` fence.
+
+### 1. The simplest widget
+
+Empty body — lists sessions of the default connector's configured directories:
+
+\`\`\`\`yaml
+\`\`\`vibed
+\`\`\`
+\`\`\`\`
+
+That's already a live dashboard: click a card to open the chat, click a session id to copy it.
+
+### 2. Pick directories — the option you'll use most
+
+\`\`\`\`yaml
+\`\`\`vibed
+dirs:
+  - ~/spaces/my-project
+  - ~/spaces/monorepo/*
+\`\`\`
+\`\`\`\`
+
+\`~\` expands to your home folder. A trailing \`/*\` matches the directory **plus everything beneath it** (a whole monorepo in one widget). Without \`dirs\`, the connector's directories from Settings are used.
+
+### 3. Shape the widget
+
+\`\`\`yaml
+title: My work
+layout: table
+pageSize: 20
+\`\`\`
+
+- \`title\` — a heading above the dashboard
+- \`layout\` — \`cards\` (default) or \`table\` (compact)
+- \`pageSize\` — sessions per page (default: the plugin setting)
+
+### 4. Multiple connectors
+
+\`\`\`yaml
+connector: claude
+dirs:
+  - ~/spaces/my-project
+\`\`\`
+
+Connectors are named in Settings → Vibed (e.g. a second OpenCode server, or a Claude Code transcript root). Omit the key to use the default.
+
+### 5. Pin specific sessions
+
+\`\`\`\`yaml
+\`\`\`vibed
+sessions:
+  - ses_abc123def456
+  - ses_def456abc123
+\`\`\`
+\`\`\`\`
+
+With only \`sessions:\` the block renders a clean widget — just the cards, no toolbar. Missing ids show as dashed "(not found)" cards. Copy ids from any dashboard (click the id) or the chat's ⋮ menu.
+
+### 6. Filter by tags
+
+\`\`\`yaml
+tags:
+  - deep-work
+\`\`\`
+
+Tags come from session notes — open a chat and hit the sticky-note button to create one; its frontmatter tags become the session's tags. A session matches when its note carries **all** listed tags.
+
+### 7. Show archived sessions
+
+\`\`\`yaml
+archived: true
+\`\`\`
+
+Archived sessions (and \`opencode run --archived\` CI runs) are hidden by default, like the OpenCode TUI. Combine with the filter box \`is:archived\` to see only those.
+
+### 8. Relative dirs
+
+\`\`\`yaml
+basedir: ~/spaces
+dirs:
+  - loomp-os
+  - tools/*
+\`\`\`
+
+\`basedir\` is the prefix for relative \`dirs\`; cards show paths relative to it.
+
+## Configuring the sessions a widget starts
+
+Beyond listing, a block can configure new sessions created from it:
+
+\`\`\`\`yaml
+\`\`\`vibed
+dirs:
+  - ~/spaces/my-project
+model: zai/glm-5.3
+agent: build
+\`\`\`
+\`\`\`\`
+
+- \`model\` (\`provider/model[#variant]\`) and \`agent\` prefill the draft's selectors
+- \`permissions\` (JSON) and \`environment\` (JSON) apply at create time only
+
+"Root state" keys — \`skills\`, \`mcp\`, \`commands\`, \`agents\`, \`providers\`, \`references\`, \`default_agent\` — declare the **desired directory config**: at session start vibed diffs it against the live OpenCode config and asks for consent before installing anything. Never put secrets in blocks; use OpenCode's \`{env:VAR}\` substitution.
+
+## JSON works too
+
+The body can be one JSON object; \`#\` lines are comments in the simple format:
+
+\`\`\`\`yaml
+\`\`\`vibed
+{"dirs": ["~/spaces/my-project"], "layout": "table"}
+\`\`\`
+\`\`\`\`
+
+## The filter box
+
+Every dashboard has a search box speaking a tiny query language:
+
+- \`is:running\` — state (\`running\`, \`waiting\`, \`question\`, \`error\`, \`interrupted\`, \`delegating\`, \`suspended\`, \`archived\`, \`idle\`)
+- \`#tag\` — sessions whose note carries the tag
+- \`dir:my-project\` — directory substring
+- \`model:glm\` — model substring
+- \`"two words"\` — title phrase
+
+Combine freely: \`is:running #deep-work model:glm\`. Set a filter, then hit the **copy** toolbar button: \`#tag\` criteria bake into the block's \`tags:\` key; the rest (\`is:\`, \`dir:\`, \`model:\`, text) ride along as an \`# active filter:\` comment — the DSL can't express them, so the pasted block starts unfiltered.
+
+## Chat, in one paragraph
+
+Click any session to open the live chat. Approvals and agent questions appear as banners you can answer inline; prompts can **steer** (join the running turn) or **queue** (wait for idle). The ⋮ menu renames and archives the session; subagents nest under their parent and their approval requests surface there too.
+
+## Connectors
+
+Settings → Vibed manages connectors — the local OpenCode v2 server (zero-config), additional OpenCode servers (URL + password), the legacy v1 SQLite database, and the Claude Code / Codex / Cursor transcript roots. Each shows a health check and its capabilities.
+`;
 
 // ---------------------------------------------------------------------------
 // Dashboard filter query. Tokens: `#tag` (session-note tag), `is:<state>`
@@ -4620,6 +4771,12 @@ class SessionsDashboard {
       toolButton(toolbar, "rotate-cw", "Refresh", "Refresh sessions").addEventListener("click", () =>
         this.load(),
       );
+      // Help (spec/013): the widget quick-start. Sits before "+" so the
+      // DSL doesn't require a README round-trip.
+      toolButton(toolbar, "help-circle", "How to use vibed", "Open the quick-start guide").addEventListener(
+        "click",
+        () => this.plugin.activateHelpView(),
+      );
       // New sessions need a drafts-capable connector (OpenCode v2) — the
       // dashboard's own connector, not whatever is globally default.
       let draftsCapable = false;
@@ -5403,6 +5560,41 @@ class SessionsDashboardChild extends MarkdownRenderChild {
 
   onunload() {
     this.dashboard.destroy();
+  }
+}
+
+// Help page (spec/013): renders the in-app guide. Static by design — the
+// markdown constant carries yaml-fenced examples, never vibed fences, so
+// no live dashboard mounts inside the page.
+class VibedHelpView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+  }
+
+  getViewType() {
+    return VIEW_TYPE_HELP;
+  }
+
+  getDisplayText() {
+    return "Vibed help";
+  }
+
+  getIcon() {
+    return "help-circle";
+  }
+
+  async onOpen() {
+    this.contentEl.empty();
+    this.contentEl.addClass("vibed-help-view");
+    const body = this.contentEl.createDiv({ cls: "vibed-help-body" });
+    await MarkdownRenderer.render(
+      this.app,
+      VIBED_HELP_MD.replaceAll(AGENT_REFERENCE_VERSION_TOKEN, this.plugin.manifest.version),
+      body,
+      "",
+      this,
+    );
   }
 }
 
@@ -10610,6 +10802,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
     this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
+    this.registerView(VIEW_TYPE_HELP, (leaf) => new VibedHelpView(leaf, this));
     // Note-embeddable dashboards: ```vibed blocks render the same
     // dashboard as the view, configured by the block body. A `connector:`
     // option selects a named connector; without it the default is used.
@@ -10628,6 +10821,11 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       id: "open-sessions",
       name: "Open OpenCode sessions",
       callback: () => this.activateView(),
+    });
+    this.addCommand({
+      id: "open-help",
+      name: "Open vibed help",
+      callback: () => this.activateHelpView(),
     });
     this.addCommand({
       id: "new-session",
@@ -10983,6 +11181,17 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     if (!leaf) {
       leaf = this.app.workspace.getRightLeaf(false);
       await leaf.setViewState({ type: VIEW_TYPE_SESSIONS, active: true });
+    }
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  // Help page (spec/013): reuse the open help leaf, else open beside the
+  // sessions view in the right sidebar.
+  async activateHelpView() {
+    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_HELP)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false);
+      await leaf.setViewState({ type: VIEW_TYPE_HELP, active: true });
     }
     this.app.workspace.revealLeaf(leaf);
   }

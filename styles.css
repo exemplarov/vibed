@@ -2,6 +2,20 @@
   padding: 1rem;
 }
 
+/* Help page (spec/013): readable column, like a settings page. */
+.vibed-help-view {
+  padding: 1rem 0.75rem;
+}
+
+.vibed-help-body {
+  max-width: 46rem;
+  margin: 0 auto;
+}
+
+.vibed-help-body pre {
+  white-space: pre-wrap;
+}
+
 .opencode-sessions-header {
   display: flex;
   align-items: center;
