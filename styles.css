@@ -1426,6 +1426,31 @@
   margin-top: 0.45rem;
 }
 
+/* Running-subagent rows (spec/014): quieter than the head — metadata, not
+   a call to action. The Open button jumps to the child session. */
+.oc-permission-subagent .oc-permission-sub-row {
+  font-weight: normal;
+  margin-top: 0.35rem;
+}
+
+.oc-permission-subagent .oc-permission-sub-row .oc-permission-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oc-permission-subagent .oc-permission-sub-meta {
+  font-size: var(--font-smaller);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oc-permission-subagent .oc-permission-sub-row button {
+  margin-left: auto;
+}
+
 .oc-permission-actions button.oc-permission-open,
 .oc-permission-head button.oc-permission-open {
   color: var(--text-muted);

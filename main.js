@@ -2701,6 +2701,32 @@ class OpenCode2Driver extends ConnectorDriver {
     return { asks, questionSessions };
   }
 
+  // Descendant sessions (child or deeper) still in an active state — the
+  // async-subagent signal (spec/014). A background subagent outlives the
+  // parent's own turn, so the parent's live state reads "idle" while work
+  // continues under it; the parent view derives its delegating badge and
+  // the running-subagents strip from this list.
+  async activeDescendants(sessionId) {
+    const active = [];
+    for (const [childId, state] of this.liveStates) {
+      if (childId === sessionId || !ACTIVE_STATES.has(state.status)) continue;
+      if (!(await this.ancestorChain(childId)).includes(sessionId)) continue;
+      let info = {};
+      try {
+        info = (await this.client.session(childId))?.data || {};
+      } catch {
+        // metadata is optional — the id alone still links to the child
+      }
+      active.push({
+        id: childId,
+        state: state.status,
+        title: info.title || "",
+        agent: info.agent || "",
+      });
+    }
+    return active;
+  }
+
   // ----- listing ---------------------------------------------------------------
 
   // DB listing when enabled and present; API listing otherwise (remote
@@ -5177,9 +5203,11 @@ class SessionsDashboard {
   // from the top level and attach as `row.subsessions` (oldest first) with a
   // live count of active ones in `row.subsessionsActive`. Children whose
   // parent is not in the current rows (filtered-out directory, pinned
-  // widget) stay top-level so nothing is silently dropped. A running parent
-  // with active children is re-stated as "delegating" — OpenCode has no
-  // dedicated server status for it, so the signal is derived here.
+  // widget) stay top-level so nothing is silently dropped. A parent with
+  // active children is re-stated as "delegating" — whether the parent
+  // itself is running (foreground delegation) or idle (async subagents
+  // outliving the parent's turn, spec/014) — OpenCode has no dedicated
+  // server status for either, so the signal is derived here.
   groupSubsessions(rows) {
     const byId = new Map(rows.map((row) => [row.id, row]));
     const byParent = new Map();
@@ -5214,7 +5242,13 @@ class SessionsDashboard {
         } else if (childStates.includes("question")) {
           row.state = "question";
           row.stateLabel = "Subagent needs answer";
-        } else if (row.rawState === "running" && row.subsessionsActive > 0) {
+        } else if (
+          row.subsessionsActive > 0 &&
+          (row.rawState === "running" || row.rawState === "idle")
+        ) {
+          // Terminal parent states (error/interrupted/suspended/archived)
+          // keep their label — the parent's own outcome outranks in-flight
+          // children; only running and idle parents read as delegating.
           row.state = "delegating";
           row.stateLabel = STATE_LABELS.delegating;
         } else {
@@ -5820,6 +5854,9 @@ class SessionChatView extends ItemView {
     // parked on descendant sessions, and descendants with question forms.
     this.descendantAsks = [];
     this.descendantQuestionIds = new Set();
+    // Descendants with work still in flight (spec/014): async subagents
+    // outlive the parent's turn, so an "idle" live state alone hides them.
+    this.descendantActive = [];
     this.replyingDescendant = false;
     this.pendingQuestion = null;
     this.replyingQuestion = false;
@@ -6522,6 +6559,8 @@ class SessionChatView extends ItemView {
       );
     } else if (this.descendantAsks.length || this.descendantQuestionIds.size) {
       this.hintEl.setText("A subagent is waiting on you — see the banner below");
+    } else if (this.descendantActive.length) {
+      this.hintEl.setText("Subagents running in the background — see the banner below");
     } else if (this.isDraft()) {
       this.hintEl.setText("Draft — your first message will create the session");
     } else if (this.busy) {
@@ -6571,6 +6610,11 @@ class SessionChatView extends ItemView {
       state = "question"; // a subagent is blocked on a question (spec/011)
     } else if (this.busy) {
       state = "running";
+    } else if (this.descendantActive.length) {
+      // Async subagents still running under this session (spec/014) — the
+      // parent's own turn is done, so live state alone reads "idle". A busy
+      // parent keeps "running": its own stream outranks the children.
+      state = "delegating";
     } else if (live) {
       // v2 streams carry terminal states (interrupted/error); a live
       // "running" without local busy tracking reads as idle there. File
@@ -8134,17 +8178,37 @@ class SessionChatView extends ItemView {
     const data = event.data || {};
     switch (type) {
       case "session.execution.started":
+        // Foreign sessionID = a descendant's lifecycle event re-delivered
+        // via the ancestor fan-out (spec/014): an async subagent started.
+        // It must not flip this (parent) view's own busy state — re-probe
+        // the running-subagent strip instead.
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.refreshPendingDescendants().catch(() => {});
+          break;
+        }
         this.setBusy(true);
         break;
       case "session.execution.succeeded":
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.refreshPendingDescendants().catch(() => {});
+          break;
+        }
         this.setBusy(false, "succeeded");
         this.scheduleReconcile();
         break;
       case "session.execution.interrupted":
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.refreshPendingDescendants().catch(() => {});
+          break;
+        }
         this.setBusy(false, "interrupted");
         this.scheduleReconcile();
         break;
       case "session.execution.failed":
+        if (data.sessionID && data.sessionID !== this.sessionId) {
+          this.refreshPendingDescendants().catch(() => {});
+          break;
+        }
         this.setBusy(false, "failed");
         this.scheduleReconcile();
         break;
@@ -8457,19 +8521,31 @@ class SessionChatView extends ItemView {
     this.updateComposer();
   }
 
-  // Rehydrates subagent blockers from the server (the stream does not replay
-  // asks missed while disconnected — same gap the own-ask refresh heals).
+  // Rehydrates subagent blockers and running subagents from the server (the
+  // stream does not replay asks missed while disconnected — same gap the
+  // own-ask refresh heals — and async subagents may have started before
+  // this view opened, spec/011/spec/014).
   async refreshPendingDescendants() {
     if (!this.sessionId || !this.driver || this.offline) return;
-    if (typeof this.driver.descendantBlockers !== "function") return;
-    try {
-      const blockers = await this.driver.descendantBlockers(this.sessionId);
-      if (this.unsubscribed) return;
+    if (
+      typeof this.driver.descendantBlockers !== "function" &&
+      typeof this.driver.activeDescendants !== "function"
+    ) {
+      return;
+    }
+    // Independent probes: one failing must not discard the other's result.
+    const blockers = await this.driver
+      .descendantBlockers(this.sessionId)
+      .catch(() => null);
+    const active = await this.driver
+      .activeDescendants(this.sessionId)
+      .catch(() => null);
+    if (this.unsubscribed) return;
+    if (blockers) {
       this.descendantAsks = blockers.asks || [];
       this.descendantQuestionIds = new Set(blockers.questionSessions || []);
-    } catch {
-      return; // event fan-out keeps us informed anyway
     }
+    if (active) this.descendantActive = active;
     this.renderDescendantBanner();
     this.renderBadge();
     this.updateComposer();
@@ -8479,7 +8555,11 @@ class SessionChatView extends ItemView {
     const banner = this.descendantEl;
     if (!banner) return;
     banner.empty();
-    if (!this.descendantAsks.length && !this.descendantQuestionIds.size) {
+    if (
+      !this.descendantAsks.length &&
+      !this.descendantQuestionIds.size &&
+      !this.descendantActive.length
+    ) {
       banner.style.display = "none";
       return;
     }
@@ -8524,6 +8604,35 @@ class SessionChatView extends ItemView {
       open.addEventListener("click", () =>
         this.plugin.openSession({ connectorId: this.connectorId, sessionId }),
       );
+    }
+    // Async subagents in flight (spec/014): the parent's turn is done, so
+    // nothing else on this page says work is still running — list each
+    // child with a jump, TUI terminal-tasks parity.
+    if (this.descendantActive.length) {
+      const head = banner.createDiv({ cls: "oc-permission-head" });
+      setIcon(head.createSpan({ cls: "oc-permission-icon" }), "bot");
+      head.createSpan({
+        cls: "oc-permission-title",
+        text:
+          this.descendantActive.length === 1
+            ? "Subagent running in the background"
+            : `${this.descendantActive.length} subagents running in the background`,
+      });
+      for (const child of this.descendantActive) {
+        const row = banner.createDiv({ cls: "oc-permission-head oc-permission-sub-row" });
+        setIcon(row.createSpan({ cls: "oc-permission-icon" }), "git-branch");
+        row.createSpan({
+          cls: "oc-permission-title",
+          text: child.title || `${child.id.slice(0, 12)}…`,
+        });
+        if (child.agent) {
+          row.createSpan({ cls: "oc-permission-sub-meta", text: child.agent });
+        }
+        const open = row.createEl("button", { cls: "oc-permission-open", text: "Open" });
+        open.addEventListener("click", () =>
+          this.plugin.openSession({ connectorId: this.connectorId, sessionId: child.id }),
+        );
+      }
     }
   }
 
@@ -11565,9 +11674,15 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   }
 };
 
-// Events that carry a session's blocked-on-human state; re-delivered to the
-// session's ancestors so parent views can surface subagent asks (spec/011).
+// Events re-delivered to the session's ancestors so parent views can react
+// to subagent activity: blocked-on-human state (asks/forms, spec/011) and
+// execution lifecycle (spec/014 — an async subagent starts and ends while
+// the parent's own turn is already over).
 const DESCENDANT_EVENT_TYPES = new Set([
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
   "permission.asked",
   "permission.replied",
   "form.created",

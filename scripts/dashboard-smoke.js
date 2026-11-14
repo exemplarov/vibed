@@ -263,6 +263,26 @@ const check = async (name, fn) => {
     if (!texts2.includes("Orphan")) throw new Error("orphan subsession dropped");
   });
 
+  check("idle parent with running child derives delegating (async subagents)", () => {
+    const dash = new SessionsDashboard(plugin, makeEl("div"), {});
+    // Async delegation: the parent's own turn is done (idle) while a
+    // background child keeps running — the card must not read "Idle".
+    const parent = { id: "p1", state: "idle", time_created: 10 };
+    const child = { id: "c1", parent_id: "p1", state: "running", time_created: 20 };
+    const grouped = dash.groupSubsessions([parent, child]);
+    const row = grouped.find((r) => r.id === "p1");
+    if (!row || row.subsessionsActive !== 1) throw new Error("active child not counted");
+    if (row.state !== "delegating") throw new Error(`expected delegating, got ${row.state}`);
+    if (row.stateLabel !== "Subagents running") throw new Error("delegating label missing");
+    // Terminal parent states keep their label despite active children.
+    const errored = { id: "p2", state: "error", time_created: 10 };
+    const child2 = { id: "c2", parent_id: "p2", state: "running", time_created: 20 };
+    const grouped2 = dash.groupSubsessions([errored, child2]);
+    if (grouped2.find((r) => r.id === "p2")?.state !== "error") {
+      throw new Error("error parent must keep its own state");
+    }
+  });
+
   check("parseBlockConfig parses inline JSON values and list items", () => {
     const config = parseBlockConfig(
       [
