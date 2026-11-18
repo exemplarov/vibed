@@ -553,6 +553,19 @@ function directoryInSubtree(directory, base) {
   return directory === base || directory.startsWith(`${base}/`);
 }
 
+// Local existence check for a configured directory (spec/015): a missing
+// directory silently empties dashboards and fails session creation. Only
+// meaningful for local-dirs connectors — a remote server's directories
+// live on another machine.
+function directoryExistsLocally(directory) {
+  try {
+    const stats = fs.statSync(String(directory || ""), { throwIfNoEntry: false });
+    return !!stats && stats.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Session-note helpers. Notes are ordinary vault markdown files attached to
 // a session via a `session:` frontmatter key — never via the filename — so
@@ -2430,9 +2443,11 @@ class ConnectorDriver {
   // Directory-resolution capabilities for dashboards and the new-session
   // flow. Local-access backends (transcript files, local databases) expand
   // `~` and honor subtree (`/*`) entries; OpenCode2Driver narrows both for
-  // API-only listings of remote servers.
+  // API-only listings of remote servers. `localDirs` (spec/015) marks
+  // connectors whose configured dirs live on this machine — the only ones
+  // where a local existence check means anything.
   directoryCapabilities() {
-    return { home: true, subtree: true };
+    return { home: true, subtree: true, localDirs: true };
   }
 
   async health() {
@@ -2740,9 +2755,10 @@ class OpenCode2Driver extends ConnectorDriver {
   // database access — an API-only listing of a remote server must not
   // expand it (the remote home differs). Subtree (`/*`) entries work in
   // both modes: the API listing pages the full tree and matches
-  // client-side.
+  // client-side. `localDirs` (spec/015) follows database access: without
+  // it the server may be remote and its directories are not ours to stat.
   directoryCapabilities() {
-    return { home: this.databaseUsable(), subtree: true };
+    return { home: this.databaseUsable(), subtree: true, localDirs: this.databaseUsable() };
   }
 
   async listSessions(options = {}) {
@@ -4968,7 +4984,7 @@ class SessionsDashboard {
     const driver = this.driver();
     const connector = this.connectorEntry?.connector;
     if (!driver || !connector) return notices;
-    let capabilities = { home: true, subtree: true };
+    let capabilities = { home: true, subtree: true, localDirs: true };
     try {
       capabilities = driver.directoryCapabilities?.() || capabilities;
     } catch {
@@ -5005,6 +5021,32 @@ class SessionsDashboard {
       if (!resolved.length) {
         notices.warnings.push(
           'No directories configured — OpenCode listings are empty without explicit directories. Add them to the block (dirs:) or the connector\'s settings.',
+        );
+      }
+    }
+    // Missing-dir warning (spec/015): a directory that doesn't exist on
+    // this machine silently empties the widget. Only local-dirs
+    // connectors — a remote server's paths can't be stat'ed here. Drivers
+    // predating the flag inherit the `home` capability (home expansion
+    // already implies paths resolve locally).
+    const localDirs = capabilities.localDirs !== undefined ? capabilities.localDirs : capabilities.home;
+    if (localDirs) {
+      let basedir = "";
+      try {
+        basedir = this.plugin.resolveDirectories({ dirs: [], basedir: this.options.basedir }, connector).basedir;
+      } catch {
+        /* no basedir resolution available — entries check as-is */
+      }
+      const missing = rawEntries
+        .map((entry) => {
+          const expanded = expandHomePath(entry);
+          const joined = basedir && !path.isAbsolute(expanded) ? path.join(basedir, expanded) : expanded;
+          return { entry, target: path.normalize(joined).replace(/\/\*$/, "") };
+        })
+        .filter(({ target }) => target && !directoryExistsLocally(target));
+      if (missing.length) {
+        notices.warnings.push(
+          `Not found on this machine: ${missing.map(({ entry }) => `"${entry}"`).join(", ")} — sessions in a missing directory stay invisible.`,
         );
       }
     }
@@ -5718,6 +5760,27 @@ function parseComposerCommand(text) {
   return { name: head.slice(1), args: [firstLineArgs, restLines].filter(Boolean).join("\n") };
 }
 
+// Newest-first merge of the two prompt-history sources (spec/015): the
+// in-window log of send attempts (recorded before delivery, so failed
+// prompts survive) and the loaded transcript's user prompts (chronological
+// order — the server's own record). Deduplicated by exact text; the
+// in-window log leads because its tail is the most recent.
+function mergePromptHistory(localEntries, transcriptTexts, limit = 100) {
+  const seen = new Set();
+  const entries = [];
+  const admit = (raw) => {
+    const text = String(raw || "").trim();
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    entries.push(text);
+  };
+  const local = Array.isArray(localEntries) ? localEntries : [];
+  for (let index = local.length - 1; index >= 0; index -= 1) admit(local[index]);
+  const transcript = Array.isArray(transcriptTexts) ? transcriptTexts : [];
+  for (let index = transcript.length - 1; index >= 0; index -= 1) admit(transcript[index]);
+  return entries.slice(0, limit);
+}
+
 // /api/mcp replies differ across server generations: released v2 wraps an
 // array ({location, data: [{name, status: {status, error?}}]}), newer builds
 // return a name → status record, possibly without the wrapper. Normalized to
@@ -5898,6 +5961,18 @@ class SessionChatView extends ItemView {
     this.cmdRows = [];
     this.cmdIndex = -1;
     this.cmdQuery = null;
+    // Prompt history (spec/015): in-window log of send attempts (kept
+    // even when delivery fails), the history popup's DOM/state, and the
+    // arrow-key recall position (recallIndex -1 = not recalling).
+    this.promptHistory = [];
+    this.historyMenuEl = null;
+    this.historyListEl = null;
+    this.historyFilterEl = null;
+    this.historyOpen = false;
+    this.historyRows = [];
+    this.historyIndex = -1;
+    this.recallIndex = -1;
+    this.recallDraft = "";
     // Pending inbox (spec/010): admitted-but-undelivered items by inboxID
     // (= future message id), plus endpoint support (null = unprobed,
     // false = server without inbox API → legacy rendering).
@@ -6314,6 +6389,11 @@ class SessionChatView extends ItemView {
     });
     this.inputEl.addEventListener("keydown", (event) => this.onComposerKeydown(event));
     this.inputEl.addEventListener("input", () => {
+      // Any manual edit ends an arrow-key recall (spec/015) — the draft
+      // it would restore is stale now. Programmatic sets don't fire
+      // "input", so recall itself is unaffected.
+      this.recallIndex = -1;
+      this.recallDraft = "";
       this.autoGrow();
       this.updateCommandMenu();
     });
@@ -6321,6 +6401,24 @@ class SessionChatView extends ItemView {
     // the composer text is a leading "/word", mirroring the TUI.
     this.cmdMenuEl = composer.createDiv({ cls: "oc-cmdmenu", attr: { hidden: "" } });
     this.cmdListEl = this.cmdMenuEl.createDiv({ cls: "oc-cmdmenu-list" });
+    // Prompt-history popup (spec/015): same anchor as the command menu,
+    // with its own filter field — the GUI perk over the TUI's raw ↑/↓.
+    this.historyMenuEl = composer.createDiv({ cls: "oc-historymenu", attr: { hidden: "" } });
+    const historyHead = this.historyMenuEl.createDiv({ cls: "oc-historymenu-head" });
+    this.historyFilterEl = historyHead.createEl("input", {
+      type: "search",
+      cls: "oc-historymenu-filter",
+      attr: {
+        placeholder: "Filter prompts…  (↑/↓ to move, Enter to insert, Esc to close)",
+        spellcheck: "false",
+      },
+    });
+    this.historyFilterEl.addEventListener("input", () => {
+      this.historyIndex = 0;
+      this.renderHistoryMenu();
+    });
+    this.historyFilterEl.addEventListener("keydown", (event) => this.onHistoryFilterKeydown(event));
+    this.historyListEl = this.historyMenuEl.createDiv({ cls: "oc-historymenu-list" });
     const actions = composer.createDiv({ cls: "oc-composer-actions" });
     this.agentSelect = actions.createEl("select", { cls: "oc-agent-select" });
     this.agentSelect.title = "Agent";
@@ -6329,6 +6427,17 @@ class SessionChatView extends ItemView {
     this.modelSelect.title = "Model";
     this.modelSelect.addEventListener("change", () => this.onModelChange());
     this.hintEl = actions.createSpan({ cls: "oc-hint", text: "" });
+    // Prompt history (spec/015): failed sends stay reachable here even
+    // when the composer moved on.
+    this.historyButton = actions.createEl("button", {
+      cls: "oc-icon-button oc-history-button",
+      attr: {
+        "aria-label": "Prompt history",
+        title: "Prompt history (Ctrl/Cmd+↑) — recent prompts from this session and this window",
+      },
+    });
+    setIcon(this.historyButton, "history");
+    this.historyButton.addEventListener("click", () => this.toggleHistoryMenu());
     this.stopButton = actions.createEl("button", { cls: "oc-stop", text: "Stop" });
     this.stopButton.addEventListener("click", () => this.stop());
     // Queue (spec/010): visible only while the session runs — the one
@@ -6427,6 +6536,45 @@ class SessionChatView extends ItemView {
         return;
       }
     }
+    // Prompt history (spec/015): Mod+↑ opens the popup; plain ↑/↓ recall
+    // prompts TUI-style when the caret sits at the textarea's start/end
+    // (or a recall is already under way — then the arrows are ours).
+    const plainArrow =
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && !event.isComposing;
+    if ((event.metaKey || event.ctrlKey) && event.key === "ArrowUp" && !event.shiftKey && !event.altKey) {
+      event.preventDefault();
+      this.openHistoryMenu();
+      return;
+    }
+    if (this.historyOpen) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeHistoryMenu(true);
+        return;
+      }
+      // The popup holds focus while open; keys arriving here mean the
+      // user clicked back into the textarea — step aside and let them
+      // type (the event falls through to normal handling).
+      this.closeHistoryMenu();
+    }
+    if (plainArrow && this.cmdQuery === null) {
+      const down = event.key === "ArrowDown";
+      if (this.recallIndex >= 0) {
+        event.preventDefault();
+        this.recallPrompt(down ? 1 : -1);
+        return;
+      }
+      const length = this.inputEl.value.length;
+      const atEdge = down
+        ? this.inputEl.selectionStart === length && this.inputEl.selectionEnd === length
+        : this.inputEl.selectionStart === 0 && this.inputEl.selectionEnd === 0;
+      if (atEdge && this.promptHistoryEntries().length) {
+        event.preventDefault();
+        this.recallPrompt(down ? 1 : -1);
+      }
+    }
   }
 
   // Loads the directory's slash commands (same location scoping as the
@@ -6503,6 +6651,177 @@ class SessionChatView extends ItemView {
     this.cmdRows = [];
     this.cmdIndex = -1;
     if (this.cmdMenuEl) this.cmdMenuEl.hidden = true;
+  }
+
+  // ----- prompt history (spec/015) ---------------------------------------------
+
+  // Records a send attempt BEFORE delivery — failed prompts (missing
+  // directory, server down) stay recallable even though the server never
+  // saw them.
+  rememberPrompt(text) {
+    const value = String(text || "").trim();
+    if (!value) return;
+    if (this.promptHistory[this.promptHistory.length - 1] === value) return;
+    this.promptHistory.push(value);
+    if (this.promptHistory.length > 200) this.promptHistory.shift();
+    this.recallIndex = -1;
+    this.recallDraft = "";
+  }
+
+  // Merged history (newest first): the in-window log plus the loaded
+  // transcript's user prompts — the server's own record of what was sent.
+  promptHistoryEntries(limit = 100) {
+    const transcriptTexts = [];
+    for (const id of this.order) {
+      const record = this.messages.get(id);
+      if (record?.msg?.type === "user") transcriptTexts.push(record.msg.text);
+    }
+    return mergePromptHistory(this.promptHistory, transcriptTexts, limit);
+  }
+
+  // TUI-style ↑/↓ recall: walks entries newest → oldest; cycling past the
+  // newest restores the pre-recall draft. Manual edits end the recall
+  // (input listener).
+  recallPrompt(delta) {
+    const entries = this.promptHistoryEntries();
+    if (!entries.length) return;
+    if (this.recallIndex === -1) {
+      if (delta > 0) return; // ↓ from a fresh composer has nothing newer
+      this.recallDraft = this.inputEl.value;
+      this.recallIndex = entries.length - 1;
+    } else {
+      this.recallIndex += delta;
+      if (this.recallIndex >= entries.length) {
+        const draft = this.recallDraft;
+        this.recallIndex = -1;
+        this.recallDraft = "";
+        this.setComposerText(draft);
+        return;
+      }
+    }
+    if (this.recallIndex < 0) this.recallIndex = 0;
+    this.setComposerText(entries[this.recallIndex]);
+  }
+
+  // Programmatic composer write: no "input" event fires, so an ongoing
+  // recall survives; caret lands at the end.
+  setComposerText(text) {
+    if (!this.inputEl) return;
+    this.inputEl.value = text;
+    this.autoGrow();
+    this.updateCommandMenu();
+    this.updateComposer();
+    this.inputEl.setSelectionRange(text.length, text.length);
+  }
+
+  // Puts a failed prompt back into the composer — unless the user typed
+  // something new while the request was in flight (history still holds
+  // the failed prompt). Returns whether the composer took it.
+  restoreComposerPrompt(text) {
+    if (!this.inputEl || this.inputEl.value.trim()) return false;
+    this.inputEl.value = text;
+    this.autoGrow();
+    this.updateComposer();
+    return true;
+  }
+
+  toggleHistoryMenu() {
+    if (this.historyOpen) this.closeHistoryMenu(true);
+    else this.openHistoryMenu();
+  }
+
+  openHistoryMenu() {
+    if (this.readOnly || !this.historyMenuEl) return;
+    this.historyOpen = true;
+    this.historyMenuEl.hidden = false;
+    if (this.historyFilterEl) {
+      this.historyFilterEl.value = "";
+      this.historyFilterEl.focus();
+    }
+    this.historyIndex = 0;
+    this.renderHistoryMenu();
+  }
+
+  closeHistoryMenu(refocus = false) {
+    this.historyOpen = false;
+    this.historyRows = [];
+    this.historyIndex = -1;
+    if (this.historyMenuEl) this.historyMenuEl.hidden = true;
+    if (refocus) this.inputEl?.focus();
+  }
+
+  renderHistoryMenu() {
+    if (!this.historyOpen || !this.historyListEl) return;
+    const query = (this.historyFilterEl?.value || "").trim().toLowerCase();
+    const entries = this.promptHistoryEntries().filter((text) =>
+      !query ? true : text.toLowerCase().includes(query),
+    );
+    this.historyRows = entries.slice(0, 30);
+    this.historyIndex = Math.min(Math.max(this.historyIndex, 0), Math.max(this.historyRows.length - 1, -1));
+    this.historyListEl.empty();
+    if (!this.historyRows.length) {
+      this.historyListEl.createDiv({
+        cls: "oc-historymenu-empty",
+        text: entries.length
+          ? "No prompts match the filter"
+          : "No prompts yet — sent and failed prompts land here",
+      });
+      return;
+    }
+    this.historyRows.forEach((text, index) => {
+      const row = this.historyListEl.createDiv({ cls: "oc-historymenu-row" });
+      if (index === this.historyIndex) row.addClass("is-selected");
+      const lines = text.split("\n");
+      row.createSpan({ cls: "oc-historymenu-text", text: lines[0] || "(empty first line)" });
+      if (lines.length > 1) {
+        row.createSpan({
+          cls: "oc-historymenu-meta",
+          text: `${lines.length - 1} more line${lines.length === 2 ? "" : "s"}`,
+        });
+      }
+      // mousedown (not click) so focus never leaves the popup mid-press.
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        this.applyHistoryEntry(text);
+      });
+    });
+  }
+
+  moveHistorySelection(delta) {
+    if (!this.historyRows.length) return;
+    this.historyIndex = (this.historyIndex + delta + this.historyRows.length) % this.historyRows.length;
+    const rows = this.historyListEl?.children || [];
+    for (let index = 0; index < rows.length; index += 1) {
+      rows[index].toggleClass("is-selected", index === this.historyIndex);
+    }
+    rows[this.historyIndex]?.scrollIntoView({ block: "nearest" });
+  }
+
+  onHistoryFilterKeydown(event) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      this.moveHistorySelection(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const entry = this.historyRows[Math.max(this.historyIndex, 0)];
+      if (entry) this.applyHistoryEntry(entry);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      this.closeHistoryMenu(true);
+    }
+  }
+
+  applyHistoryEntry(text) {
+    this.recallIndex = -1;
+    this.recallDraft = "";
+    this.setComposerText(text);
+    this.closeHistoryMenu(true);
+    this.inputEl?.focus();
   }
 
   setOffline(offline, reason = "") {
@@ -9258,6 +9577,9 @@ class SessionChatView extends ItemView {
     if (this.offline || !this.driver) return;
     const text = this.inputEl.value.trim();
     if (!text) return;
+    // History records the attempt, not the success (spec/015) — a failed
+    // send must stay recallable.
+    this.rememberPrompt(text);
     if (this.isDraft()) {
       await this.sendDraft(text, delivery);
       return;
@@ -9272,9 +9594,10 @@ class SessionChatView extends ItemView {
     try {
       await this.deliverText(this.sessionId, text, delivery);
     } catch (error) {
-      new Notice(`Send failed: ${error.message}`);
-      this.inputEl.value = text;
-      this.autoGrow();
+      const restored = this.restoreComposerPrompt(text);
+      new Notice(
+        `Send failed: ${error.message}${restored ? " — prompt restored to the composer" : " — prompt kept in history (↑ or the clock button)"}`,
+      );
     }
     this.updateComposer();
   }
@@ -9324,8 +9647,11 @@ class SessionChatView extends ItemView {
   }
 
   // Drafts create the server session lazily with the first message, so no
-  // empty sessions pile up when a draft is abandoned.
+  // empty sessions pile up when a draft is abandoned. Two failure phases,
+  // each leaving the prompt recoverable (spec/015): a failed create never
+  // cleared the composer; a failed first delivery restores it.
   async sendDraft(text, delivery = "steer") {
+    let session = null;
     try {
       // Snippet config gate (spec/007): read-only diff of the snippet's
       // desired state against the live directory; a diff opens the
@@ -9334,6 +9660,22 @@ class SessionChatView extends ItemView {
       if (this.snippetConfig) {
         const proceed = await runSnippetConfigGate(this.plugin, this.driver.client, this.draftDirectory, this.snippetConfig);
         if (!proceed) return;
+      }
+      // Missing-dir preflight (spec/015): local connectors can check the
+      // draft directory before the round-trip — the server would reject
+      // it anyway, and the failed create would eat the prompt.
+      let localDirs = true;
+      try {
+        const capabilities = this.driver.directoryCapabilities?.() || { home: true, localDirs: true };
+        localDirs = capabilities.localDirs !== undefined ? capabilities.localDirs : capabilities.home;
+      } catch {
+        /* defaults hold */
+      }
+      if (localDirs && !directoryExistsLocally(this.draftDirectory)) {
+        new Notice(
+          `Directory not found on this machine: ${this.draftDirectory} — create it or fix the configured dirs and send again; the prompt stays in the composer and history.`,
+        );
+        return;
       }
       const snippet = this.snippetConfig?.ephemeral || {};
       const created = await this.driver.client.request("/api/session", {
@@ -9345,7 +9687,7 @@ class SessionChatView extends ItemView {
           permissions: Array.isArray(snippet.permissions) ? snippet.permissions : undefined,
         },
       });
-      const session = created?.data;
+      session = created?.data;
       if (!session?.id) throw new Error("server returned no session id");
       if (snippet.environment && isPlainObject(snippet.environment)) {
         try {
@@ -9362,13 +9704,24 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       // The server resolved the default agent at creation — show it.
       this.selectAgentId(session.agent || "");
-      this.closeCommandMenu();
-      this.inputEl.value = "";
-      this.autoGrow();
-      this.jumpToBottom(true);
+    } catch (error) {
+      // Create failed before the composer was cleared — the prompt is
+      // still in it (and in history via rememberPrompt).
+      new Notice(`Could not create session: ${error.message} — prompt kept in the composer`);
+      this.updateComposer();
+      return;
+    }
+    this.closeCommandMenu();
+    this.inputEl.value = "";
+    this.autoGrow();
+    this.jumpToBottom(true);
+    try {
       await this.deliverText(session.id, text, delivery);
     } catch (error) {
-      new Notice(`Could not create session: ${error.message}`);
+      const restored = this.restoreComposerPrompt(text);
+      new Notice(
+        `Send failed: ${error.message}${restored ? " — prompt restored to the composer" : " — prompt kept in history (↑ or the clock button)"}`,
+      );
     }
     this.updateComposer();
   }
@@ -11387,7 +11740,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     }
     // `~` expands against the local home — meaningless for an API-only
     // connector whose server runs on another machine (its home differs).
-    const capabilities = entry.driver.directoryCapabilities?.() || { home: true, subtree: true };
+    const capabilities = entry.driver.directoryCapabilities?.() || { home: true, subtree: true, localDirs: true };
     if (!capabilities.home) {
       const homeEntries = this.rawDirectoryEntries(options, entry.connector).filter((entry_) =>
         entry_.startsWith("~"),
@@ -11412,6 +11765,17 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
           : "No directories configured — add them in OpenCode Sessions settings.",
       );
       return;
+    }
+    // Missing-dir preflight (spec/015): warn early but don't block — for
+    // local-dirs connectors the server would reject the directory anyway
+    // (the draft's first send refuses up front), and remote servers own
+    // their own filesystem.
+    const localDirs = capabilities.localDirs !== undefined ? capabilities.localDirs : capabilities.home;
+    if (localDirs) {
+      const missing = [...exact].filter((directory) => !directoryExistsLocally(directory));
+      if (missing.length) {
+        new Notice(`Directory not found on this machine: ${missing.join(", ")}`);
+      }
     }
     const exactDirs = [...exact];
     const snippet = options.snippet || null;

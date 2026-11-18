@@ -17,7 +17,7 @@ src = src.replace(
   obsidianLine,
   `const { Plugin = class {}, ItemView = class {}, MarkdownRenderChild = class {}, MarkdownRenderer = class {}, Modal = class { constructor(app){ if (!app) throw new Error("Modal constructed without an App — pass plugin.app at the call site"); } open() {} }, Menu = class { constructor(){ (globalThis.__smokeMenus = globalThis.__smokeMenus || []).push(this); this.items = []; } addItem(fn){ const item = { _title: "", setTitle(t){ this._title = t; return this; }, setIcon(){ return this; }, setDisabled(){ return this; }, onClick(handler){ this._onClick = handler; return this; } }; if (fn) fn(item); this.items.push(item); return this; } addSeparator(){ return this; } showAtMouseEvent() {} }, Notice = class { constructor(m){this.m=m} }, PluginSettingTab = class {}, Setting = class {}, setIcon = () => {}, EditorSuggest = class {}, FuzzySuggestModal = class { setPlaceholder() {} open() {} }, TFile = class {}, TFolder = class {} } = {};`,
 );
-src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, normalizeMcpList, normalizeCommandList, normalizeSkillList, normalizeInboxItem, inboxMessageFrom };`;
+src += `\nmodule.exports = { SessionsDashboard, SessionNotes, parseBlockConfig, extractSnippetSessionConfig, normalizeModelRef, deepMerge, deepEqual, mergeConfigChain, diffRootState, missingSkillSources, normalizeInstallCommand, checkSkillInstalls, expandHomePath, splitDirGlobs, directoryInSubtree, directoryMatchesFilter, composeVibedBlock, applyAgentReference, analyzeVibedLine, normalizeTagList, composerCommandQuery, filterCommands, parseComposerCommand, mergePromptHistory, normalizeMcpList, normalizeCommandList, normalizeSkillList, normalizeInboxItem, inboxMessageFrom };`;
 
 const tmp = path.join(require("os").tmpdir(), "vibed-dashboard-smoke.js");
 fs.writeFileSync(tmp, src);
@@ -44,6 +44,7 @@ const {
   composerCommandQuery,
   filterCommands,
   parseComposerCommand,
+  mergePromptHistory,
   normalizeMcpList,
   normalizeCommandList,
   normalizeSkillList,
@@ -453,13 +454,59 @@ const check = async (name, fn) => {
     if (!globNotices.warnings.length || !/Subtree dirs/.test(globNotices.warnings[0])) {
       throw new Error(`subtree entry must warn: ${JSON.stringify(globNotices)}`);
     }
-    // Local-capable drivers raise no notices for the same entries.
-    const dash = new SessionsDashboard(plugin, makeEl("div"), { dirs: ["/x/*", "~"] });
+    // Remote connectors never run the missing-dir check (spec/015): /srv
+    // does not exist here, but its filesystem is not ours to stat.
+    if (globNotices.warnings.some((text) => /Not found on this machine/.test(text))) {
+      throw new Error(`remote connector must not warn about local dirs: ${JSON.stringify(globNotices)}`);
+    }
+    // Local-capable drivers raise no notices for entries that exist here.
+    const home = require("os").homedir();
+    const dash = new SessionsDashboard(plugin, makeEl("div"), { dirs: [`${home}/*`, "~"] });
     dash.connectorEntry = plugin.registry.defaultConnector();
     const localNotices = dash.computeNotices();
     if (localNotices.errors.length || localNotices.warnings.length) {
       throw new Error(`local connector should be quiet: ${JSON.stringify(localNotices)}`);
     }
+  });
+
+  check("dashboards warn when configured dirs are missing locally (spec/015)", () => {
+    const home = require("os").homedir();
+    const missing = path.join(home, "vibed-smoke-does-not-exist");
+    const dash = new SessionsDashboard(plugin, makeEl("div"), {
+      dirs: [home, `${missing}/*`],
+    });
+    dash.connectorEntry = plugin.registry.defaultConnector();
+    const notices = dash.computeNotices();
+    if (notices.errors.length) throw new Error(`unexpected errors: ${JSON.stringify(notices)}`);
+    const warning = notices.warnings.find((text) => /Not found on this machine/.test(text));
+    if (!warning) throw new Error(`missing dir must warn: ${JSON.stringify(notices)}`);
+    // The raw entry (with its /* marker) is what the user typed — the
+    // warning quotes it, not the stripped base; the existing home dir
+    // must not be flagged.
+    if (!warning.includes(`"${missing}/*"`) || warning.includes(`"${home}"`)) {
+      throw new Error(`warning must quote only the missing raw entry: ${warning}`);
+    }
+  });
+
+  check("mergePromptHistory merges newest-first, dedupes, and caps", () => {
+    const merged = mergePromptHistory(
+      ["attempt-that-failed", "first"],
+      ["first", "second-from-server"],
+    );
+    // In-window log walks newest-first (its tail is newest), then the
+    // transcript's user prompts, deduped by exact text.
+    if (merged.join("|") !== "first|attempt-that-failed|second-from-server") {
+      throw new Error(`merge order wrong: ${JSON.stringify(merged)}`);
+    }
+    if (mergePromptHistory(["a"], ["a"]).length !== 1) throw new Error("exact-text dedupe failed");
+    const capped = mergePromptHistory(
+      Array.from({ length: 30 }, (_, i) => `p${i}`),
+      [],
+      10,
+    );
+    if (capped.length !== 10 || capped[0] !== "p29") throw new Error("limit/newest-first wrong");
+    if (mergePromptHistory(null, null).length) throw new Error("null inputs must yield []");
+    if (mergePromptHistory(["  ", ""], [" x "])[0] !== "x") throw new Error("blank/whitespace entries must drop");
   });
 
   check("deepMerge replaces arrays and recurses objects", () => {
