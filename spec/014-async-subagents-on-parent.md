@@ -1,6 +1,6 @@
 # spec/014 — Async subagents visible on the parent session page
 
-Status: implemented (unreleased)
+Status: implemented (v0.23.0)
 
 ## Problem
 

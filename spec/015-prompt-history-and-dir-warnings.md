@@ -1,6 +1,6 @@
 # spec/015 — Missing-directory warnings and prompt history
 
-Status: implemented (unreleased)
+Status: implemented (v0.23.0)
 
 ## Problem
 

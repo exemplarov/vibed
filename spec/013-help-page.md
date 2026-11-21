@@ -1,6 +1,6 @@
 # spec/013 — In-app help ("?" button)
 
-Status: in progress
+Status: implemented (v0.23.0)
 
 ## Problem
 
